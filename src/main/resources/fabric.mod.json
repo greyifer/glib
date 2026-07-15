@@ -1,0 +1,34 @@
+{
+	"schemaVersion": 1,
+	"id": "glib",
+	"version": "${version}",
+	"name": "glib",
+	"description": "Skin, face, live mutable texture, and skin sync helpers for Fabric mods.",
+	"authors": [
+		"Caspe"
+	],
+	"contact": {
+		"homepage": "https://github.com/greyifer/glib",
+		"sources": "https://github.com/greyifer/glib",
+		"issues": "https://github.com/greyifer/glib/issues"
+	},
+	"license": "GPL-3.0-only",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"io.github.caspe.glib.Glib"
+		],
+		"client": [
+			"io.github.caspe.glib.client.GlibClient"
+		]
+	},
+	"mixins": [
+		"glib.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"fabric-api": "*",
+		"minecraft": "~1.21.1",
+		"java": ">=21"
+	}
+}

@@ -1,0 +1,17 @@
+{
+	"required": true,
+	"minVersion": "0.8",
+	"package": "io.github.caspe.glib.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"mixins": [
+		"EntityMovementLockMixin"
+	],
+	"client": [
+		"client.AbstractClientPlayerEntityMixin",
+		"client.PlayerListEntryMixin",
+		"client.EntityRenderDispatcherMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
