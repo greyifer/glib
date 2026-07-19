@@ -9,3 +9,20 @@ run/
 
 .DS_Store
 Thumbs.db
+
+# Dependencies and generated backend output
+**/node_modules/
+backend/dist/
+backend/coverage/
+backend/.pnpm-store/
+
+# Local configuration and secrets. Example files contain names/placeholders only.
+.env
+.env.*
+!**/.env.example
+.railway/
+secrets/
+*.pem
+*.key
+*.p12
+*.jks

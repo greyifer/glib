@@ -6,6 +6,7 @@ import io.github.caspe.glib.api.client.ui.GlibRect;
 import io.github.caspe.glib.api.client.ui.GlibScreenAnimator;
 import io.github.caspe.glib.api.client.ui.GlibUi;
 import io.github.caspe.glib.api.config.GlibConfigScreen;
+import io.github.caspe.glib.client.social.GlibSocialScreen;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.MinecraftClient;
@@ -247,30 +248,64 @@ public final class GlibMenuScreen extends Screen {
 	private final List<GlibMenuAction> actions;
 	private final boolean animateOpen;
 	private final boolean rootMenu;
+	private final Text settingsTooltip;
+	private final GlibMenuEntry.ScreenFactory settingsScreenFactory;
 	private final List<GlibButton> actionButtons = new ArrayList<>();
 	private GlibButton backButton;
 	private GlibButton settingsButton;
+	private GlibButton friendsButton;
 	private double lastOpenOffset;
 
 	public GlibMenuScreen(Screen parent) {
-		this(parent, Text.literal("G'Network"), Text.literal("Choose a workspace."), rootActions(), true, true);
+		this(
+			parent,
+			Text.literal("G'Network"),
+			Text.literal("Choose a workspace."),
+			rootActions(),
+			true,
+			true,
+			Text.literal("G'Lib Settings"),
+			GlibMenuScreen::glibSettingsScreen
+		);
 	}
 
 	public GlibMenuScreen(Screen parent, Text title, Text subtitle, List<GlibMenuAction> actions) {
-		this(parent, title, subtitle, actions, false, false);
+		this(parent, title, subtitle, actions, false, false, null, null);
 	}
 
-	private GlibMenuScreen(Screen parent, Text title, Text subtitle, List<GlibMenuAction> actions, boolean animateOpen, boolean rootMenu) {
+	private GlibMenuScreen(
+		Screen parent,
+		Text title,
+		Text subtitle,
+		List<GlibMenuAction> actions,
+		boolean animateOpen,
+		boolean rootMenu,
+		Text settingsTooltip,
+		GlibMenuEntry.ScreenFactory settingsScreenFactory
+	) {
 		super(title);
 		this.parent = parent;
 		this.subtitle = subtitle == null ? Text.empty() : subtitle;
 		this.actions = List.copyOf(actions);
 		this.animateOpen = animateOpen;
 		this.rootMenu = rootMenu;
+		this.settingsTooltip = settingsTooltip;
+		this.settingsScreenFactory = settingsScreenFactory;
 	}
 
 	public static GlibMenuScreen submenu(Screen parent, Text title, Text subtitle, List<GlibMenuAction> actions) {
-		return new GlibMenuScreen(parent, title, subtitle, actions, false, false);
+		return new GlibMenuScreen(parent, title, subtitle, actions, false, false, null, null);
+	}
+
+	public static GlibMenuScreen submenu(
+		Screen parent,
+		Text title,
+		Text subtitle,
+		List<GlibMenuAction> actions,
+		Text settingsTooltip,
+		GlibMenuEntry.ScreenFactory settingsScreenFactory
+	) {
+		return new GlibMenuScreen(parent, title, subtitle, actions, false, false, settingsTooltip, settingsScreenFactory);
 	}
 
 	@Override
@@ -294,15 +329,22 @@ public final class GlibMenuScreen extends Screen {
 			actionButtons.add(button);
 			addDrawableChild(button);
 		}
-		int backWidth = rootMenu ? Math.min(180, panel.width() - 94) : panel.width() - 64;
-		int backX = rootMenu ? panel.x() + (panel.width() - backWidth) / 2 : panel.x() + 32;
+		boolean hasSettings = settingsScreenFactory != null;
+		int backWidth = rootMenu || hasSettings ? Math.min(180, panel.width() - 94) : panel.width() - 64;
+		int backX = rootMenu || hasSettings ? panel.x() + (panel.width() - backWidth) / 2 : panel.x() + 32;
 		backButton = new GlibButton(backX, panel.y() + panel.height() - (rootMenu ? 52 : 42), backWidth, 22, parent == null ? Text.literal("Back to Game") : Text.literal("Back"), ACCENT_WARN, this::requestClose);
 		addDrawableChild(backButton);
-		if (rootMenu) {
-			settingsButton = new GlibButton(panel.x() + panel.width() - 54, panel.y() + panel.height() - 52, 22, 22, Text.literal("\u2699"), 0xFF60A5FA, this::openSettings);
+		if (hasSettings) {
+			settingsButton = new GlibButton(panel.x() + panel.width() - 54, panel.y() + panel.height() - (rootMenu ? 52 : 42), 22, 22, Text.literal("\u2699"), 0xFF60A5FA, this::openSettings);
 			addDrawableChild(settingsButton);
 		} else {
 			settingsButton = null;
+		}
+		if (rootMenu) {
+			friendsButton = new GlibButton(panel.x() + panel.width() - 82, panel.y() + panel.height() - 52, 22, 22, Text.literal("F"), ACCENT, this::openFriends);
+			addDrawableChild(friendsButton);
+		} else {
+			friendsButton = null;
 		}
 		updateRootControls(rootControlsAlpha());
 	}
@@ -317,8 +359,11 @@ public final class GlibMenuScreen extends Screen {
 		renderPanel(context);
 		updateRootControls(rootControlsAlpha());
 		super.render(context, mouseX, adjustedMouseY, delta);
-		if (rootMenu && settingsButton != null && settingsButton.active && settingsButton.isHovered()) {
-			context.drawTooltip(textRenderer, Text.literal("G'Lib Settings"), mouseX, adjustedMouseY);
+		if (settingsButton != null && settingsButton.active && settingsButton.isHovered() && settingsTooltip != null) {
+			context.drawTooltip(textRenderer, settingsTooltip, mouseX, adjustedMouseY);
+		}
+		if (friendsButton != null && friendsButton.active && friendsButton.isHovered()) {
+			context.drawTooltip(textRenderer, Text.literal("Friends & Chat"), mouseX, adjustedMouseY);
 		}
 		context.getMatrices().pop();
 		if (screenAnimator.closeComplete() && client != null) {
@@ -507,6 +552,10 @@ public final class GlibMenuScreen extends Screen {
 			settingsButton.setRenderAlpha(alpha);
 			settingsButton.active = ready;
 		}
+		if (friendsButton != null) {
+			friendsButton.setRenderAlpha(alpha);
+			friendsButton.active = ready;
+		}
 	}
 
 	private static float clamp01(float value) {
@@ -524,13 +573,23 @@ public final class GlibMenuScreen extends Screen {
 	}
 
 	private void openSettings() {
-		if (client == null) {
+		if (client == null || settingsScreenFactory == null) {
 			return;
 		}
-		client.setScreen(GlibConfigScreen.builder(this, Text.literal("G'Lib Settings"))
+		client.setScreen(settingsScreenFactory.create(this));
+	}
+
+	private void openFriends() {
+		if (client != null) {
+			client.setScreen(new GlibSocialScreen(this));
+		}
+	}
+
+	private static Screen glibSettingsScreen(Screen parent) {
+		return GlibConfigScreen.builder(parent, Text.literal("G'Lib Settings"))
 			.action(Text.literal("No settings are available yet"), () -> {
 			})
-			.build());
+			.build();
 	}
 
 	private static List<GlibMenuAction> rootActions() {

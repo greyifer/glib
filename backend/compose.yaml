@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: glib
+      POSTGRES_USER: glib
+      POSTGRES_PASSWORD: glib
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glib"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - glib-postgres:/var/lib/postgresql/data
+
+volumes:
+  glib-postgres:
