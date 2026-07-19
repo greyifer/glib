@@ -16,6 +16,9 @@ public final class SocialModels {
 	public record FriendRequest(UUID requestId, Player player, String createdAt) {
 	}
 
+	public record PlayerSearchResult(UUID playerUuid, String username, String relationship, UUID requestId) {
+	}
+
 	public record Snapshot(
 		Identity me,
 		List<Player> friends,

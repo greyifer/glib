@@ -4,6 +4,7 @@ import {
   ApiError,
   hashToken,
   mojangUuid,
+  normalizePlayerSearch,
   normalizeUsername,
   orderedPair,
   parseBearer,
@@ -17,6 +18,12 @@ test("normalizes valid Minecraft usernames", () => {
 test("rejects invalid usernames", () => {
   assert.throws(() => normalizeUsername("space name"), ApiError);
   assert.throws(() => normalizeUsername("abcdefghijklmnopq"), ApiError);
+});
+
+test("normalizes player autocomplete queries", () => {
+  assert.equal(normalizePlayerSearch("  Grey_  "), "grey_");
+  assert.throws(() => normalizePlayerSearch("g"), ApiError);
+  assert.throws(() => normalizePlayerSearch("grey ifer"), ApiError);
 });
 
 test("orders UUID strings consistently and rejects self targeting", () => {

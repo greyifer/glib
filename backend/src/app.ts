@@ -88,6 +88,11 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   });
 
   app.get("/v1/social", { preHandler: authenticate }, async (request) => social.snapshot(request.actor!));
+  app.get(
+    "/v1/players/search",
+    { preHandler: authenticate, config: { rateLimit: { max: 90, timeWindow: "1 minute" } } },
+    async (request) => social.searchPlayers(request.actor!, query(request, "q")),
+  );
   app.delete("/v1/me", { preHandler: authenticate }, async (request, reply) => {
     await social.deleteAccount(request.actor!);
     return reply.status(204).send();

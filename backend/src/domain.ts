@@ -21,6 +21,17 @@ export function normalizeUsername(value: unknown): string {
   return value.toLowerCase();
 }
 
+export function normalizePlayerSearch(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new ApiError(400, "INVALID_SEARCH", "Search text is required.");
+  }
+  const query = value.trim();
+  if (query.length < 2 || query.length > 16 || !USERNAME_PATTERN.test(query)) {
+    throw new ApiError(400, "INVALID_SEARCH", "Type 2-16 letters, numbers, or underscores.");
+  }
+  return query.toLowerCase();
+}
+
 export function parseUuid(value: unknown, field = "playerUuid"): string {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
     throw new ApiError(400, "INVALID_UUID", `${field} must be a UUID.`);

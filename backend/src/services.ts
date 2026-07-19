@@ -4,6 +4,7 @@ import { first, transaction } from "./db.js";
 import {
   ApiError,
   hashToken,
+  normalizePlayerSearch,
   normalizeUsername,
   orderedPair,
   parseClientMessageId,
@@ -44,6 +45,11 @@ interface MessageRow {
   body: string;
   created_at: Date;
   read_at: Date | null;
+}
+
+interface PlayerSearchRow extends ActorRow {
+  relationship: "FRIEND" | "INCOMING" | "OUTGOING" | "NONE";
+  request_id: string | null;
 }
 
 function publicPlayer(row: PlayerRow, realtime: RealtimeHub): PublicPlayer {
@@ -224,6 +230,48 @@ export class SocialService {
         blockedAt: row.blocked_at.toISOString(),
       })),
     };
+  }
+
+  async searchPlayers(actor: Actor, rawQuery: unknown): Promise<unknown[]> {
+    const query = normalizePlayerSearch(rawQuery);
+    const result = await this.pool.query<PlayerSearchRow>(
+      `SELECT u.player_uuid, u.username,
+         CASE
+           WHEN f.player_low IS NOT NULL THEN 'FRIEND'
+           WHEN incoming.request_id IS NOT NULL THEN 'INCOMING'
+           WHEN outgoing.request_id IS NOT NULL THEN 'OUTGOING'
+           ELSE 'NONE'
+         END AS relationship,
+         COALESCE(incoming.request_id, outgoing.request_id) AS request_id
+       FROM users u
+       LEFT JOIN friendships f
+         ON f.player_low = LEAST(u.player_uuid, $1::uuid)
+        AND f.player_high = GREATEST(u.player_uuid, $1::uuid)
+       LEFT JOIN friend_requests incoming
+         ON incoming.sender_uuid = u.player_uuid AND incoming.recipient_uuid = $1
+       LEFT JOIN friend_requests outgoing
+         ON outgoing.sender_uuid = $1 AND outgoing.recipient_uuid = u.player_uuid
+       WHERE u.player_uuid <> $1
+         AND u.normalized_username IS NOT NULL
+         AND strpos(u.normalized_username, $2) > 0
+         AND NOT EXISTS (
+           SELECT 1 FROM blocks b
+           WHERE (b.blocker_uuid = $1 AND b.blocked_uuid = u.player_uuid)
+              OR (b.blocker_uuid = u.player_uuid AND b.blocked_uuid = $1)
+         )
+       ORDER BY
+         CASE WHEN strpos(u.normalized_username, $2) = 1 THEN 0 ELSE 1 END,
+         length(u.normalized_username),
+         u.normalized_username
+       LIMIT 8`,
+      [actor.playerUuid, query],
+    );
+    return result.rows.map((row) => ({
+      playerUuid: row.player_uuid,
+      username: row.username,
+      relationship: row.relationship,
+      requestId: row.request_id,
+    }));
   }
 
   async sendRequest(actor: Actor, rawUsername: unknown): Promise<unknown> {

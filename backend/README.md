@@ -47,6 +47,7 @@ For the Fabric development client, set `-Dglib.network.apiUrl=http://127.0.0.1:8
 
 - `POST /v1/auth/challenge`, `POST /v1/auth/complete`: one-use Minecraft account proof
 - `GET /v1/social`: friends, incoming/outgoing requests, blocks, and presence
+- `GET /v1/players/search?q=...`: registered-player autocomplete with relationship state
 - `/v1/friend-requests`, `/v1/friends`, `/v1/blocks`: social actions
 - `/v1/messages/:playerUuid`: authorized friend-only history and sending
 - `GET /v1/ws`: authenticated live events, chat, and presence

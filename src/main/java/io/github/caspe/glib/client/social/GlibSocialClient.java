@@ -12,6 +12,7 @@ import net.minecraft.client.MinecraftClient;
 
 import java.net.ConnectException;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -54,6 +55,12 @@ public final class GlibSocialClient implements AutoCloseable {
 
 	public CompletableFuture<Snapshot> snapshot() {
 		return authenticatedRequest("GET", "/v1/social", null, Snapshot.class);
+	}
+
+	public CompletableFuture<List<PlayerSearchResult>> searchPlayers(String query) {
+		String encoded = URLEncoder.encode(query, StandardCharsets.UTF_8);
+		return authenticatedRequest("GET", "/v1/players/search?q=" + encoded, null, PlayerSearchResult[].class)
+			.thenApply(array -> List.of(array));
 	}
 
 	public CompletableFuture<Void> sendFriendRequest(String username) {
