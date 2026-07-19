@@ -3,6 +3,7 @@ package io.github.caspe.glib.client.social;
 import com.google.gson.Gson;
 import com.mojang.authlib.GameProfile;
 import io.github.caspe.glib.api.client.ui.GlibButton;
+import io.github.caspe.glib.api.client.ui.GlibLoadingScreen;
 import io.github.caspe.glib.api.client.ui.GlibRect;
 import io.github.caspe.glib.api.client.ui.GlibUi;
 import io.github.caspe.glib.api.skin.FaceOptions;
@@ -36,12 +37,15 @@ public final class GlibChatScreen extends Screen {
 
 	private final Screen parent;
 	private final Player friend;
+	private final GlibLoadingScreen loadingScreen = new GlibLoadingScreen(ACCENT, 0xFF101722, 0.14F, 30.0F);
 	private List<ChatMessage> messages = List.of();
 	private TextFieldWidget messageField;
 	private String status = "Loading conversation...";
 	private boolean loading;
 	private boolean confirmBlock;
+	private boolean confirmRemove;
 	private GlibButton blockButton;
+	private GlibButton removeButton;
 	private AutoCloseable eventSubscription;
 
 	public GlibChatScreen(Screen parent, Player friend) {
@@ -59,10 +63,12 @@ public final class GlibChatScreen extends Screen {
 		messageField.setPlaceholder(Text.literal("Write a message"));
 		addDrawableChild(messageField);
 		addDrawableChild(new GlibButton(panel.x() + panel.width() - 90, inputY, 74, 24, Text.literal("Send"), ACCENT, this::send));
-		addDrawableChild(new GlibButton(panel.x() + panel.width() - 44, panel.y() + 17, 28, 22,
+		addDrawableChild(new GlibButton(panel.x() + panel.width() - 40, panel.y() + 17, 24, 22,
 			Text.literal("X"), 0xFFFFC857, this::close));
-		blockButton = addDrawableChild(new GlibButton(panel.x() + panel.width() - 116, panel.y() + 17, 66, 22,
+		blockButton = addDrawableChild(new GlibButton(panel.x() + panel.width() - 106, panel.y() + 17, 58, 22,
 			Text.literal(confirmBlock ? "Confirm" : "Block"), DANGER, this::block));
+		removeButton = addDrawableChild(new GlibButton(panel.x() + panel.width() - 184, panel.y() + 17, 70, 22,
+			Text.literal(confirmRemove ? "Confirm" : "Unfriend"), MUTED, this::removeFriend));
 		if (eventSubscription == null) {
 			eventSubscription = GlibSocialClient.INSTANCE.listen(event -> {
 				if (event.type().equals("chat.message")) {
@@ -77,18 +83,49 @@ public final class GlibChatScreen extends Screen {
 		loadMessages();
 	}
 
+	@Override
+	public void tick() {
+		super.tick();
+		if (loadingScreen.finished()) loadingScreen.cancel();
+	}
+
 	private void loadMessages() {
 		if (loading || client == null) return;
 		loading = true;
+		boolean showLoading = messages.isEmpty();
+		if (showLoading) loadingScreen.start("Loading conversation...", 30.0F);
 		GlibSocialClient.INSTANCE.messages(friend.playerUuid()).whenComplete((loaded, error) -> client.execute(() -> {
 			loading = false;
 			if (client.currentScreen != this) return;
+			if (showLoading) loadingScreen.finish();
 			if (error != null) {
 				status = SocialScreenSupport.message(error);
 				return;
 			}
 			messages = loaded;
 			status = friend.online() ? "Online" : "Offline - messages will be waiting when they return";
+		}));
+	}
+
+	private void removeFriend() {
+		if (!confirmRemove) {
+			confirmRemove = true;
+			confirmBlock = false;
+			removeButton.setMessage(Text.literal("Confirm"));
+			blockButton.setMessage(Text.literal("Block"));
+			status = "Press Confirm to remove " + friend.username() + " from your friends.";
+			return;
+		}
+		if (client == null || loading) return;
+		loading = true;
+		GlibSocialClient.INSTANCE.removeFriend(friend.playerUuid()).whenComplete((ignored, error) -> client.execute(() -> {
+			loading = false;
+			if (client.currentScreen != this) return;
+			if (error != null) {
+				status = SocialScreenSupport.message(error);
+				return;
+			}
+			returnToSocial();
 		}));
 	}
 
@@ -112,7 +149,9 @@ public final class GlibChatScreen extends Screen {
 	private void block() {
 		if (!confirmBlock) {
 			confirmBlock = true;
+			confirmRemove = false;
 			blockButton.setMessage(Text.literal("Confirm"));
+			removeButton.setMessage(Text.literal("Unfriend"));
 			status = "Blocking also removes this friendship. Press Confirm to continue.";
 			return;
 		}
@@ -125,8 +164,14 @@ public final class GlibChatScreen extends Screen {
 				status = SocialScreenSupport.message(error);
 				return;
 			}
-			client.setScreen(parent);
+			returnToSocial();
 		}));
+	}
+
+	private void returnToSocial() {
+		if (client == null) return;
+		client.setScreen(parent);
+		if (parent instanceof GlibSocialScreen social) social.refresh();
 	}
 
 	@Override
@@ -143,13 +188,14 @@ public final class GlibChatScreen extends Screen {
 			context.drawCenteredTextWithShadow(textRenderer, Text.literal(friend.username().substring(0, 1).toUpperCase(Locale.ROOT)), faceX + 14, faceY + 10, 0xFFFFFFFF);
 		}
 		context.drawTextWithShadow(textRenderer, Text.literal(friend.username()), panel.x() + 54, panel.y() + 15, 0xFFFFFFFF);
-		context.drawTextWithShadow(textRenderer, Text.literal(textRenderer.trimToWidth(status, panel.width() - 190)), panel.x() + 54, panel.y() + 30,
+		context.drawTextWithShadow(textRenderer, Text.literal(textRenderer.trimToWidth(status, panel.width() - 280)), panel.x() + 54, panel.y() + 30,
 			isError(status) ? DANGER : MUTED);
 		context.fill(panel.x() + 16, panel.y() + 52, panel.x() + panel.width() - 16, panel.y() + 53, LINE);
 
 		GlibRect history = new GlibRect(panel.x() + 16, panel.y() + 62, panel.width() - 32, panel.height() - 116);
 		renderMessages(context, history);
 		super.render(context, mouseX, mouseY, delta);
+		if (loadingScreen.active()) loadingScreen.render(context, textRenderer, history);
 	}
 
 	private void renderMessages(DrawContext context, GlibRect history) {

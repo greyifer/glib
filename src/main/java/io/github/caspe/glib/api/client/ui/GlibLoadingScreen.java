@@ -60,6 +60,19 @@ public final class GlibLoadingScreen {
 		active = false;
 	}
 
+	/**
+	 * Moves an active transition into its final fade. This is useful for asynchronous work:
+	 * start with a long loading duration, then finish as soon as the real operation completes.
+	 */
+	public void finish() {
+		if (!active) return;
+		float fadeOutStart = fadeSeconds + loadingSeconds;
+		float elapsed = elapsedSeconds();
+		if (elapsed < fadeOutStart) {
+			startedAtNanos -= (long) ((fadeOutStart - elapsed) * 1_000_000_000.0F);
+		}
+	}
+
 	public boolean active() {
 		return active;
 	}

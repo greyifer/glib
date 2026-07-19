@@ -1,104 +1,109 @@
 package io.github.caspe.glib.client.social;
 
 import io.github.caspe.glib.api.client.ui.GlibButton;
+import io.github.caspe.glib.api.client.ui.GlibLoadingScreen;
 import io.github.caspe.glib.api.client.ui.GlibRect;
 import io.github.caspe.glib.api.client.ui.GlibUi;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
-import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.text.Text;
 
-import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 import static io.github.caspe.glib.client.social.SocialModels.*;
 
 @Environment(EnvType.CLIENT)
 public final class GlibNetworkSettingsScreen extends Screen {
-	private static final int PANEL = 0xF0121720;
-	private static final int PANEL_SOFT = 0xE0161D28;
-	private static final int LINE = 0x80394655;
-	private static final int ACCENT = 0xFF45D483;
-	private static final int MUTED = 0xFF9EA7B3;
+	private static final int BACKDROP = 0x7805090E;
+	private static final int PANEL = 0xF410151D;
+	private static final int SURFACE = 0xE61A212B;
+	private static final int LINE = 0x70424C5B;
+	private static final int ACCENT = 0xFF4CDB8A;
+	private static final int MUTED = 0xFF98A3B1;
+	private static final int DANGER = 0xFFFF718D;
+
 	private final Screen parent;
-	private final Snapshot snapshot;
-	private TextFieldWidget endpointField;
-	private String status = "The URL is public configuration; it is not a secret.";
+	private final List<Player> blocked;
+	private final GlibLoadingScreen loadingScreen = new GlibLoadingScreen(ACCENT, 0xFF101722, 0.14F, 30.0F);
+	private String status = "Manage who can contact you through G'Network.";
 	private boolean confirmDelete;
+	private boolean changed;
 	private GlibButton deleteButton;
 
 	public GlibNetworkSettingsScreen(Screen parent, Snapshot snapshot) {
-		super(Text.literal("G'Network Settings"));
+		super(Text.literal("Social Settings"));
 		this.parent = parent;
-		this.snapshot = snapshot;
+		this.blocked = new ArrayList<>(snapshot == null ? List.of() : snapshot.blocked());
 	}
 
 	@Override
 	protected void init() {
 		GlibRect panel = panelRect();
-		endpointField = new TextFieldWidget(textRenderer, panel.x() + 18, panel.y() + 70, panel.width() - 130, 22, Text.literal("Backend URL"));
-		endpointField.setMaxLength(256);
-		endpointField.setText(GlibNetworkConfig.get().apiUrl());
-		addDrawableChild(endpointField);
-		addDrawableChild(new GlibButton(panel.x() + panel.width() - 104, panel.y() + 70, 86, 22, Text.literal("Save URL"), ACCENT, this::save));
-		addDrawableChild(new GlibButton(panel.x() + panel.width() - 68, panel.y() + 17, 50, 22, Text.literal("Back"), 0xFFFFC857, this::close));
-		deleteButton = addDrawableChild(new GlibButton(panel.x() + panel.width() - 184, panel.y() + 17, 110, 22,
-			Text.literal("Delete My Data"), 0xFFFF718D, this::deleteAccount));
+		addDrawableChild(new GlibButton(panel.x() + panel.width() - 40, panel.y() + 16, 24, 22,
+			Text.literal("X"), 0xFFFFC857, this::close));
 
-		if (snapshot != null) {
-			int y = panel.y() + 140;
-			int max = Math.max(0, (panel.height() - 170) / 28);
-			for (int index = 0; index < Math.min(max, snapshot.blocked().size()); index++) {
-				Player blocked = snapshot.blocked().get(index);
-				addDrawableChild(new GlibButton(panel.x() + 22, y, panel.width() - 44, 22,
-					Text.literal("Unblock " + blocked.username()), 0xFFFF718D, () -> unblock(blocked)));
-				y += 28;
-			}
+		GlibRect blockedArea = blockedArea(panel);
+		int maxRows = Math.max(1, blockedArea.height() / 34);
+		for (int index = 0; index < Math.min(maxRows, blocked.size()); index++) {
+			Player player = blocked.get(index);
+			addDrawableChild(new GlibButton(blockedArea.x() + 8, blockedArea.y() + 8 + index * 34,
+				blockedArea.width() - 16, 26, Text.literal("Unblock " + player.username()), MUTED, () -> unblock(player)));
 		}
+
+		deleteButton = addDrawableChild(new GlibButton(panel.x() + panel.width() - 142, panel.y() + panel.height() - 71,
+			124, 28, Text.literal(confirmDelete ? "Confirm delete" : "Delete my data"), DANGER, this::deleteAccount));
 	}
 
-	private void save() {
-		try {
-			GlibNetworkConfig.save(endpointField.getText());
-			GlibSocialClient.INSTANCE.reset();
-			status = "Saved. New connections will use this URL.";
-		} catch (IllegalArgumentException | IOException exception) {
-			status = exception.getMessage() == null ? "Could not save the URL." : exception.getMessage();
-		}
+	@Override
+	public void tick() {
+		super.tick();
+		if (loadingScreen.finished()) loadingScreen.cancel();
 	}
 
 	private void unblock(Player player) {
-		if (client == null) return;
+		if (client == null || loadingScreen.active()) return;
 		status = "Unblocking " + player.username() + "...";
+		loadingScreen.start("Updating privacy settings...", 30.0F);
 		GlibSocialClient.INSTANCE.unblock(player.playerUuid()).whenComplete((ignored, error) -> client.execute(() -> {
 			if (client.currentScreen != this) return;
+			loadingScreen.finish();
 			if (error != null) {
 				status = SocialScreenSupport.message(error);
 				return;
 			}
-			status = player.username() + " was unblocked. Reopen this screen to refresh the list.";
+			blocked.removeIf(entry -> entry.playerUuid().equals(player.playerUuid()));
+			changed = true;
+			status = player.username() + " can contact you again.";
+			clearChildren();
+			init();
 		}));
 	}
 
 	private void deleteAccount() {
 		if (!confirmDelete) {
 			confirmDelete = true;
-			deleteButton.setMessage(Text.literal("Confirm Delete"));
-			status = "This permanently deletes your friends, requests, blocks, messages, and sessions.";
+			deleteButton.setMessage(Text.literal("Confirm delete"));
+			status = "This permanently removes your friends, chats, requests, and blocks.";
 			return;
 		}
-		if (client == null) return;
+		if (client == null || loadingScreen.active()) return;
 		deleteButton.active = false;
+		loadingScreen.start("Deleting your social data...", 30.0F);
 		GlibSocialClient.INSTANCE.deleteAccount().whenComplete((ignored, error) -> client.execute(() -> {
 			if (client.currentScreen != this) return;
+			loadingScreen.finish();
 			if (error != null) {
 				status = SocialScreenSupport.message(error);
 				deleteButton.active = true;
 				return;
 			}
 			GlibSocialClient.INSTANCE.reset();
-			status = "Your G'Network data was deleted.";
+			blocked.clear();
+			changed = true;
+			status = "Your G'Network social data was deleted.";
 			confirmDelete = false;
 			deleteButton.setMessage(Text.literal("Deleted"));
 		}));
@@ -107,18 +112,28 @@ public final class GlibNetworkSettingsScreen extends Screen {
 	@Override
 	public void render(DrawContext context, int mouseX, int mouseY, float delta) {
 		GlibRect panel = panelRect();
-		context.fill(0, 0, width, height, 0x62060A10);
+		GlibRect blockedArea = blockedArea(panel);
+		context.fill(0, 0, width, height, BACKDROP);
 		GlibUi.drawPanel(context, panel.x(), panel.y(), panel.width(), panel.height(), PANEL, LINE);
 		context.fill(panel.x(), panel.y(), panel.x() + panel.width(), panel.y() + 2, ACCENT);
-		context.drawTextWithShadow(textRenderer, title, panel.x() + 18, panel.y() + 19, 0xFFFFFFFF);
-		context.drawTextWithShadow(textRenderer, Text.literal("Railway backend URL (HTTPS)"), panel.x() + 18, panel.y() + 53, MUTED);
-		context.drawTextWithShadow(textRenderer, Text.literal(textRenderer.trimToWidth(status, panel.width() - 36)), panel.x() + 18, panel.y() + 101, MUTED);
-		context.drawTextWithShadow(textRenderer, Text.literal("Blocked players"), panel.x() + 18, panel.y() + 121, 0xFFFFFFFF);
-		GlibUi.drawPanel(context, panel.x() + 14, panel.y() + 135, panel.width() - 28, panel.height() - 151, PANEL_SOFT, LINE);
-		if (snapshot == null || snapshot.blocked().isEmpty()) {
-			context.drawTextWithShadow(textRenderer, Text.literal("No blocked players."), panel.x() + 22, panel.y() + 148, MUTED);
+
+		context.drawTextWithShadow(textRenderer, Text.literal("Social settings"), panel.x() + 18, panel.y() + 17, 0xFFFFFFFF);
+		context.drawTextWithShadow(textRenderer, Text.literal("Privacy, blocked players, and account data"), panel.x() + 18, panel.y() + 32, MUTED);
+		context.drawTextWithShadow(textRenderer, Text.literal("Blocked players"), panel.x() + 18, panel.y() + 63, 0xFFFFFFFF);
+		GlibUi.drawPanel(context, blockedArea.x(), blockedArea.y(), blockedArea.width(), blockedArea.height(), SURFACE, LINE);
+		if (blocked.isEmpty()) {
+			context.drawCenteredTextWithShadow(textRenderer, Text.literal("Nobody is blocked"), blockedArea.x() + blockedArea.width() / 2,
+				blockedArea.y() + blockedArea.height() / 2 - 5, MUTED);
 		}
+
+		int dangerY = panel.y() + panel.height() - 86;
+		context.fill(panel.x() + 18, dangerY, panel.x() + panel.width() - 18, dangerY + 1, LINE);
+		context.drawTextWithShadow(textRenderer, Text.literal("Delete social data"), panel.x() + 18, dangerY + 16, 0xFFFFFFFF);
+		context.drawTextWithShadow(textRenderer, Text.literal("Permanently removes your G'Network account and conversations."), panel.x() + 18, dangerY + 32, MUTED);
+		context.drawTextWithShadow(textRenderer, Text.literal(textRenderer.trimToWidth(status, panel.width() - 36)), panel.x() + 18,
+			panel.y() + panel.height() - 22, status.contains("failed") || status.contains("Could not") ? DANGER : MUTED);
 		super.render(context, mouseX, mouseY, delta);
+		if (loadingScreen.active()) loadingScreen.render(context, textRenderer, blockedArea);
 	}
 
 	@Override
@@ -127,7 +142,9 @@ public final class GlibNetworkSettingsScreen extends Screen {
 
 	@Override
 	public void close() {
-		if (client != null) client.setScreen(parent);
+		if (client == null) return;
+		client.setScreen(parent);
+		if (changed && parent instanceof GlibSocialScreen social) social.refresh();
 	}
 
 	@Override
@@ -135,9 +152,13 @@ public final class GlibNetworkSettingsScreen extends Screen {
 		return false;
 	}
 
+	private GlibRect blockedArea(GlibRect panel) {
+		return new GlibRect(panel.x() + 18, panel.y() + 80, panel.width() - 36, panel.height() - 184);
+	}
+
 	private GlibRect panelRect() {
-		int panelWidth = Math.min(620, width - 24);
-		int panelHeight = Math.min(420, height - 24);
+		int panelWidth = Math.min(580, width - 24);
+		int panelHeight = Math.min(410, height - 24);
 		return new GlibRect((width - panelWidth) / 2, (height - panelHeight) / 2, panelWidth, panelHeight);
 	}
 }

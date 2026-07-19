@@ -140,7 +140,7 @@ public final class GlibSocialClient implements AutoCloseable {
 
 	private synchronized CompletableFuture<String> ensureAuthenticated() {
 		if (!GlibNetworkConfig.configured()) {
-			return CompletableFuture.failedFuture(new GlibNetworkException("NOT_CONFIGURED", "Set the Railway backend URL in Network Settings first."));
+			return CompletableFuture.failedFuture(new GlibNetworkException("NOT_CONFIGURED", "G'Network is not configured in this build."));
 		}
 		String existingToken = token;
 		if (existingToken != null) {
