@@ -44,9 +44,16 @@ interface MessageRow {
   client_message_id: string;
   sender_uuid: string;
   recipient_uuid: string;
+  sender_username_at_send: string;
   body: string;
   created_at: Date;
   read_at: Date | null;
+  state: "SENT" | "EDITED" | "DELETED";
+  edited_at: Date | null;
+  deleted_at: Date | null;
+  reply_to_message_id: string | null;
+  attachment_kind: string | null;
+  attachment_label: string | null;
 }
 
 interface PlayerSearchRow extends ActorRow {
@@ -66,8 +73,15 @@ interface GroupMessageRow {
   client_message_id: string;
   group_id: string;
   sender_uuid: string;
+  sender_username_at_send: string;
   body: string;
   created_at: Date;
+  state: "SENT" | "EDITED" | "DELETED";
+  edited_at: Date | null;
+  deleted_at: Date | null;
+  reply_to_message_id: string | null;
+  attachment_kind: string | null;
+  attachment_label: string | null;
 }
 
 function publicPlayer(row: PlayerRow, realtime: RealtimeHub): PublicPlayer {
@@ -87,9 +101,16 @@ function chatMessage(row: MessageRow): ChatMessage {
     clientMessageId: row.client_message_id,
     senderUuid: row.sender_uuid,
     recipientUuid: row.recipient_uuid,
+    senderUsernameAtSend: row.sender_username_at_send,
     body: row.body,
     createdAt: row.created_at.toISOString(),
     readAt: row.read_at?.toISOString() ?? null,
+    state: row.state,
+    editedAt: row.edited_at?.toISOString() ?? null,
+    deletedAt: row.deleted_at?.toISOString() ?? null,
+    replyToMessageId: row.reply_to_message_id,
+    attachmentKind: row.attachment_kind,
+    attachmentLabel: row.attachment_label,
   };
 }
 
@@ -99,8 +120,15 @@ function groupChatMessage(row: GroupMessageRow): GroupChatMessage {
     clientMessageId: row.client_message_id,
     groupId: row.group_id,
     senderUuid: row.sender_uuid,
+    senderUsernameAtSend: row.sender_username_at_send,
     body: row.body,
     createdAt: row.created_at.toISOString(),
+    state: row.state,
+    editedAt: row.edited_at?.toISOString() ?? null,
+    deletedAt: row.deleted_at?.toISOString() ?? null,
+    replyToMessageId: row.reply_to_message_id,
+    attachmentKind: row.attachment_kind,
+    attachmentLabel: row.attachment_label,
   };
 }
 
@@ -463,7 +491,9 @@ export class SocialService {
       if (Number.isNaN(before.getTime())) throw new ApiError(400, "INVALID_CURSOR", "before must be an ISO timestamp.");
     }
     const result = await this.pool.query<MessageRow>(
-      `SELECT message_id, client_message_id, sender_uuid, recipient_uuid, body, created_at, read_at
+      `SELECT message_id, client_message_id, sender_uuid, recipient_uuid, sender_username_at_send,
+              body, created_at, read_at, state, edited_at, deleted_at, reply_to_message_id,
+              attachment_kind, attachment_label
        FROM messages
        WHERE ((sender_uuid = $1 AND recipient_uuid = $2) OR (sender_uuid = $2 AND recipient_uuid = $1))
          AND created_at < $3
@@ -486,12 +516,14 @@ export class SocialService {
     await this.assertNotBlocked(this.pool, actor.playerUuid, targetUuid);
 
     const result = await this.pool.query<MessageRow>(
-      `INSERT INTO messages(client_message_id, sender_uuid, recipient_uuid, body)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO messages(client_message_id, sender_uuid, recipient_uuid, sender_username_at_send, body)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (sender_uuid, client_message_id) DO UPDATE SET body = messages.body
        WHERE messages.recipient_uuid = EXCLUDED.recipient_uuid AND messages.body = EXCLUDED.body
-       RETURNING message_id, client_message_id, sender_uuid, recipient_uuid, body, created_at, read_at`,
-      [clientMessageId, actor.playerUuid, targetUuid, body],
+       RETURNING message_id, client_message_id, sender_uuid, recipient_uuid, sender_username_at_send,
+                 body, created_at, read_at, state, edited_at, deleted_at, reply_to_message_id,
+                 attachment_kind, attachment_label`,
+      [clientMessageId, actor.playerUuid, targetUuid, actor.username, body],
     );
     if (result.rowCount !== 1) {
       throw new ApiError(409, "CLIENT_MESSAGE_ID_REUSED", "That client message ID was already used for different content.");
@@ -655,7 +687,9 @@ export class SocialService {
       if (Number.isNaN(before.getTime())) throw new ApiError(400, "INVALID_CURSOR", "before must be an ISO timestamp.");
     }
     const result = await this.pool.query<GroupMessageRow>(
-      `SELECT message_id, client_message_id, group_id, sender_uuid, body, created_at
+      `SELECT message_id, client_message_id, group_id, sender_uuid, sender_username_at_send,
+              body, created_at, state, edited_at, deleted_at, reply_to_message_id,
+              attachment_kind, attachment_label
        FROM group_messages WHERE group_id = $1 AND created_at < $2
        ORDER BY created_at DESC LIMIT 100`,
       [groupId, before],
@@ -669,12 +703,14 @@ export class SocialService {
     const body = validateMessage(rawBody);
     await this.assertGroupMember(this.pool, groupId, actor.playerUuid);
     const result = await this.pool.query<GroupMessageRow>(
-      `INSERT INTO group_messages(group_id, client_message_id, sender_uuid, body)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO group_messages(group_id, client_message_id, sender_uuid, sender_username_at_send, body)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (sender_uuid, client_message_id) DO UPDATE SET body = group_messages.body
        WHERE group_messages.group_id = EXCLUDED.group_id AND group_messages.body = EXCLUDED.body
-       RETURNING message_id, client_message_id, group_id, sender_uuid, body, created_at`,
-      [groupId, clientMessageId, actor.playerUuid, body],
+       RETURNING message_id, client_message_id, group_id, sender_uuid, sender_username_at_send,
+                 body, created_at, state, edited_at, deleted_at, reply_to_message_id,
+                 attachment_kind, attachment_label`,
+      [groupId, clientMessageId, actor.playerUuid, actor.username, body],
     );
     if (result.rowCount !== 1) {
       throw new ApiError(409, "CLIENT_MESSAGE_ID_REUSED", "That client message ID was already used for different content.");
@@ -700,8 +736,20 @@ export class SocialService {
 
   async cleanMessages(retentionDays: number): Promise<void> {
     await Promise.all([
-      this.pool.query("DELETE FROM messages WHERE created_at < now() - ($1 * interval '1 day')", [retentionDays]),
-      this.pool.query("DELETE FROM group_messages WHERE created_at < now() - ($1 * interval '1 day')", [retentionDays]),
+      this.pool.query(
+        `UPDATE messages SET body = '', state = 'DELETED', deleted_at = COALESCE(deleted_at, now()),
+            attachment_kind = NULL, attachment_label = NULL
+         WHERE created_at < now() - ($1 * interval '1 day') AND state <> 'DELETED'`,
+        [retentionDays],
+      ),
+      this.pool.query(
+        `UPDATE group_messages SET body = '', state = 'DELETED', deleted_at = COALESCE(deleted_at, now()),
+            attachment_kind = NULL, attachment_label = NULL
+         WHERE created_at < now() - ($1 * interval '1 day') AND state <> 'DELETED'`,
+        [retentionDays],
+      ),
+      this.pool.query("DELETE FROM messages WHERE deleted_at < now() - interval '30 days'"),
+      this.pool.query("DELETE FROM group_messages WHERE deleted_at < now() - interval '30 days'"),
     ]);
   }
 

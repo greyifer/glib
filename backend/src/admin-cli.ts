@@ -9,9 +9,37 @@ const pool = createPool(config);
 try {
   await migrate(pool);
   const action = (process.env.ADMIN_ACTION?.trim().toLowerCase() || "grant");
-  const playerUuid = parseUuid(process.env.ADMIN_TARGET_UUID, "ADMIN_TARGET_UUID");
 
-  if (action === "grant") {
+  if (action === "audit") {
+    const requestedLimit = Number(process.env.ADMIN_AUDIT_LIMIT ?? "40");
+    const limit = Number.isInteger(requestedLimit) ? Math.max(1, Math.min(100, requestedLimit)) : 40;
+    const result = await pool.query<{
+      created_at: Date;
+      username: string | null;
+      role: string | null;
+      action: string;
+      target_type: string | null;
+      target_id: string | null;
+    }>(
+      `SELECT audit.created_at, users.username, accounts.role, audit.action, audit.target_type, audit.target_id
+       FROM admin_audit_log audit
+       LEFT JOIN users ON users.player_uuid = audit.admin_uuid
+       LEFT JOIN admin_accounts accounts ON accounts.player_uuid = audit.admin_uuid
+       ORDER BY audit.created_at DESC LIMIT $1`,
+      [limit],
+    );
+    for (const row of result.rows) {
+      process.stdout.write([
+        row.created_at.toISOString(),
+        safeAuditField(row.username ?? "Unknown admin"),
+        safeAuditField(row.role ?? "DISABLED"),
+        safeAuditField(row.action),
+        safeAuditField(row.target_type ?? ""),
+        safeAuditField(row.target_id ?? ""),
+      ].join("\t") + "\n");
+    }
+  } else if (action === "grant") {
+    const playerUuid = parseUuid(process.env.ADMIN_TARGET_UUID, "ADMIN_TARGET_UUID");
     const suppliedPassword = process.env.ADMIN_INITIAL_PASSWORD;
     const pipedPasswords = process.env.ADMIN_PASSWORD_STDIN === "1"
       ? await readPasswordPairFromStdin()
@@ -48,14 +76,19 @@ try {
     await pool.query("DELETE FROM admin_sessions WHERE player_uuid = $1", [playerUuid]);
     process.stdout.write(`Granted ${role} access to ${playerUuid}. The initial password must be changed at first login.\n`);
   } else if (action === "revoke") {
+    const playerUuid = parseUuid(process.env.ADMIN_TARGET_UUID, "ADMIN_TARGET_UUID");
     await pool.query("UPDATE admin_accounts SET disabled_at = now(), updated_at = now() WHERE player_uuid = $1", [playerUuid]);
     await pool.query("DELETE FROM admin_sessions WHERE player_uuid = $1", [playerUuid]);
     process.stdout.write(`Revoked moderator access for ${playerUuid}.\n`);
   } else {
-    throw new Error("ADMIN_ACTION must be grant or revoke");
+    throw new Error("ADMIN_ACTION must be grant, revoke, or audit");
   }
 } finally {
   await pool.end();
+}
+
+function safeAuditField(value: string): string {
+  return value.replace(/[\t\r\n]/g, " ").slice(0, 160);
 }
 
 async function readPasswordPairFromStdin(): Promise<readonly [string, string]> {

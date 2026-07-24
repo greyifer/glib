@@ -47,6 +47,12 @@ interface ReportMessageRow {
   sender_username: string;
   body: string;
   created_at: Date;
+  state: "SENT" | "EDITED" | "DELETED";
+  edited_at: Date | null;
+  deleted_at: Date | null;
+  reply_to_message_id: string | null;
+  attachment_kind: string | null;
+  attachment_label: string | null;
 }
 
 interface DirectReportMessageRow extends ReportMessageRow {
@@ -74,10 +80,15 @@ interface ReportRow {
   created_at: Date;
   reviewed_at: Date | null;
   reviewed_by: string | null;
+  duplicate_count?: string;
 }
 
 interface ContextRow extends ReportMessageRow {
   sequence_number?: number;
+}
+
+interface ModerationMessageRow extends ReportMessageRow {
+  recipient_uuid: string | null;
 }
 
 export async function hashAdminPassword(password: string): Promise<string> {
@@ -314,8 +325,10 @@ export class ReportService {
 
   private async submitDirect(client: PoolClient, actor: Actor, messageId: string, reason: string): Promise<unknown> {
     const selectedResult = await client.query<DirectReportMessageRow>(
-      `SELECT m.message_id, m.sender_uuid, m.recipient_uuid, u.username AS sender_username,
-              m.body, m.created_at
+      `SELECT m.message_id, m.sender_uuid, m.recipient_uuid,
+              COALESCE(m.sender_username_at_send, u.username) AS sender_username,
+              m.body, m.created_at, m.state, m.edited_at, m.deleted_at, m.reply_to_message_id,
+              m.attachment_kind, m.attachment_label
        FROM messages m JOIN users u ON u.player_uuid = m.sender_uuid
        WHERE m.message_id = $1 AND (m.sender_uuid = $2 OR m.recipient_uuid = $2)`,
       [messageId, actor.playerUuid],
@@ -333,8 +346,10 @@ export class ReportService {
 
   private async submitGroup(client: PoolClient, actor: Actor, messageId: string, reason: string): Promise<unknown> {
     const selectedResult = await client.query<GroupReportMessageRow>(
-      `SELECT m.message_id, m.group_id, m.sender_uuid, u.username AS sender_username,
-              m.body, m.created_at
+      `SELECT m.message_id, m.group_id, m.sender_uuid,
+              COALESCE(m.sender_username_at_send, u.username) AS sender_username,
+              m.body, m.created_at, m.state, m.edited_at, m.deleted_at, m.reply_to_message_id,
+              m.attachment_kind, m.attachment_label
        FROM group_messages m
        JOIN users u ON u.player_uuid = m.sender_uuid
        JOIN group_members member ON member.group_id = m.group_id AND member.player_uuid = $2
@@ -385,9 +400,24 @@ export class ReportService {
       const message = contextResult.messages[index]!;
       await client.query(
         `INSERT INTO message_report_context(
-           report_id, sequence_number, source_message_id, sender_uuid, sender_username, body, created_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [reportId, index, message.message_id, message.sender_uuid, message.sender_username, message.body, message.created_at],
+           report_id, sequence_number, source_message_id, sender_uuid, sender_username, body, created_at,
+           message_state, edited_at, deleted_at, reply_to_source_message_id, attachment_kind, attachment_label
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [
+          reportId,
+          index,
+          message.message_id,
+          message.sender_uuid,
+          message.sender_username,
+          message.body,
+          message.created_at,
+          message.state,
+          message.edited_at,
+          message.deleted_at,
+          message.reply_to_message_id,
+          message.attachment_kind,
+          message.attachment_label,
+        ],
       );
     }
     return { reportId, status: "OPEN", contextMessageCount: contextResult.messages.length };
@@ -521,99 +551,203 @@ export class ModerationService {
     rawFirstUuid: unknown,
     rawSecondUuid: unknown,
     rawBefore: unknown,
+    rawSearch: unknown,
+    rawSenderUuid: unknown,
+    rawFilter: unknown,
+    rawAround: unknown,
     ip: string,
   ): Promise<unknown> {
     const firstUuid = parseUuid(rawFirstUuid, "firstUuid");
     const secondUuid = parseUuid(rawSecondUuid, "secondUuid");
     const [low, high] = orderedPair(firstUuid, secondUuid);
     const before = cursorDate(rawBefore);
-    const participants = await this.pool.query<{ player_uuid: string; username: string }>(
-      "SELECT player_uuid, username FROM users WHERE player_uuid IN ($1, $2) ORDER BY player_uuid",
+    const search = messageSearch(rawSearch);
+    const senderUuid = optionalUuid(rawSenderUuid, "sender");
+    const filter = messageFilter(rawFilter);
+    const around = optionalDate(rawAround, "around");
+    const participants = await this.pool.query<{
+      player_uuid: string;
+      username: string;
+      created_at: Date;
+      last_seen_at: Date | null;
+    }>(
+      `SELECT player_uuid, username, created_at, last_seen_at
+       FROM users WHERE player_uuid IN ($1, $2) ORDER BY player_uuid`,
       [low, high],
     );
     if (participants.rowCount !== 2) throw new ApiError(404, "CONVERSATION_NOT_FOUND", "That conversation is unavailable.");
-    const result = await this.pool.query<{
-      message_id: string;
-      sender_uuid: string;
-      recipient_uuid: string;
-      sender_username: string;
-      body: string;
-      created_at: Date;
-    }>(
-      `SELECT m.message_id, m.sender_uuid, m.recipient_uuid, u.username AS sender_username, m.body, m.created_at
-       FROM messages m JOIN users u ON u.player_uuid = m.sender_uuid
-       WHERE LEAST(m.sender_uuid, m.recipient_uuid) = $1
-         AND GREATEST(m.sender_uuid, m.recipient_uuid) = $2
-         AND m.created_at < $3
-       ORDER BY m.created_at DESC, m.message_id DESC LIMIT 100`,
-      [low, high, before],
-    );
     const targetId = `${low}:${high}`;
+    const [result, stats, sharedGroups, investigation] = await Promise.all([
+      this.pool.query<ModerationMessageRow>(
+        `WITH selected AS (
+           SELECT m.message_id, m.sender_uuid, m.recipient_uuid,
+                  COALESCE(m.sender_username_at_send, u.username) AS sender_username,
+                  m.body, m.created_at, m.state, m.edited_at, m.deleted_at, m.reply_to_message_id,
+                  m.attachment_kind, m.attachment_label
+           FROM messages m JOIN users u ON u.player_uuid = m.sender_uuid
+           WHERE LEAST(m.sender_uuid, m.recipient_uuid) = $1
+             AND GREATEST(m.sender_uuid, m.recipient_uuid) = $2
+             AND m.created_at < $3
+             AND ($4 = '' OR strpos(lower(m.body), $4) > 0)
+             AND ($5::uuid IS NULL OR m.sender_uuid = $5)
+             AND ($6 = 'ALL'
+               OR ($6 = 'LINKS' AND m.body ~* '(https?://|www\\.)')
+               OR ($6 = 'MENTIONS' AND m.body ~ '@[A-Za-z0-9_]{1,16}')
+               OR ($6 = 'ATTACHMENTS' AND m.attachment_kind IS NOT NULL))
+           ORDER BY
+             CASE WHEN $7::timestamptz IS NULL THEN 0
+               ELSE abs(extract(epoch FROM (m.created_at - $7::timestamptz))) END,
+             m.created_at DESC, m.message_id DESC
+           LIMIT 100
+         )
+         SELECT * FROM selected ORDER BY created_at, message_id`,
+        [low, high, before, search, senderUuid, filter, around],
+      ),
+      this.pool.query<{ message_count: string; created_at: Date | null; last_message_at: Date | null }>(
+        `SELECT count(*)::text AS message_count, min(created_at) AS created_at, max(created_at) AS last_message_at
+         FROM messages
+         WHERE LEAST(sender_uuid, recipient_uuid) = $1 AND GREATEST(sender_uuid, recipient_uuid) = $2`,
+        [low, high],
+      ),
+      this.pool.query<{ group_id: string; name: string }>(
+        `SELECT g.group_id, g.name
+         FROM group_members first_member
+         JOIN group_members second_member
+           ON second_member.group_id = first_member.group_id AND second_member.player_uuid = $2
+         JOIN chat_groups g ON g.group_id = first_member.group_id
+         WHERE first_member.player_uuid = $1
+         ORDER BY lower(g.name), g.group_id`,
+        [low, high],
+      ),
+      this.investigation(admin, "DIRECT", targetId),
+    ]);
     await this.auth.audit(admin.playerUuid, "ADMIN_DIRECT_MESSAGES_VIEWED", "DIRECT_CONVERSATION", targetId, {
       ip,
       resultCount: result.rows.length,
+      search: search || undefined,
+      senderUuid: senderUuid || undefined,
+      filter,
+      around: around?.toISOString(),
     });
+    const conversationStats = first(stats.rows);
     return {
-      participants: participants.rows.map((row) => ({ playerUuid: row.player_uuid, username: row.username })),
-      messages: result.rows.reverse().map((row) => ({
-        messageId: row.message_id,
-        senderUuid: row.sender_uuid,
-        recipientUuid: row.recipient_uuid,
-        senderUsername: row.sender_username,
-        body: row.body,
-        createdAt: row.created_at.toISOString(),
+      conversationId: targetId,
+      participants: participants.rows.map((row) => ({
+        playerUuid: row.player_uuid,
+        username: row.username,
+        role: "PARTICIPANT",
+        accountCreatedAt: row.created_at.toISOString(),
+        lastSeenAt: row.last_seen_at?.toISOString() ?? null,
       })),
+      sharedGroups: sharedGroups.rows.map((row) => ({ groupId: row.group_id, name: row.name })),
+      messageCount: Number(conversationStats.message_count),
+      createdAt: conversationStats.created_at?.toISOString() ?? null,
+      lastMessageAt: conversationStats.last_message_at?.toISOString() ?? null,
+      messages: result.rows.map(adminMessageJson),
+      ...investigation,
     };
   }
 
-  async groupMessages(admin: AdminActor, rawGroupId: unknown, rawBefore: unknown, ip: string): Promise<unknown> {
+  async groupMessages(
+    admin: AdminActor,
+    rawGroupId: unknown,
+    rawBefore: unknown,
+    rawSearch: unknown,
+    rawSenderUuid: unknown,
+    rawFilter: unknown,
+    rawAround: unknown,
+    ip: string,
+  ): Promise<unknown> {
     const groupId = parseUuid(rawGroupId, "groupId");
     const before = cursorDate(rawBefore);
-    const groupResult = await this.pool.query<{ group_id: string; name: string; owner_uuid: string }>(
-      "SELECT group_id, name, owner_uuid FROM chat_groups WHERE group_id = $1",
+    const search = messageSearch(rawSearch);
+    const senderUuid = optionalUuid(rawSenderUuid, "sender");
+    const filter = messageFilter(rawFilter);
+    const around = optionalDate(rawAround, "around");
+    const groupResult = await this.pool.query<{
+      group_id: string;
+      name: string;
+      owner_uuid: string;
+      created_at: Date;
+    }>(
+      "SELECT group_id, name, owner_uuid, created_at FROM chat_groups WHERE group_id = $1",
       [groupId],
     );
     const group = groupResult.rows[0];
     if (!group) throw new ApiError(404, "GROUP_NOT_FOUND", "That group is unavailable.");
-    const [members, messages] = await Promise.all([
-      this.pool.query<{ player_uuid: string; username: string }>(
-        `SELECT u.player_uuid, u.username FROM group_members gm
+    const [members, messages, count, investigation] = await Promise.all([
+      this.pool.query<{
+        player_uuid: string;
+        username: string;
+        created_at: Date;
+        last_seen_at: Date | null;
+        admin_role: "MODERATOR" | "OWNER" | null;
+      }>(
+        `SELECT u.player_uuid, u.username, u.created_at, u.last_seen_at, admin.role AS admin_role
+         FROM group_members gm
          JOIN users u ON u.player_uuid = gm.player_uuid
+         LEFT JOIN admin_accounts admin ON admin.player_uuid = u.player_uuid AND admin.disabled_at IS NULL
          WHERE gm.group_id = $1 ORDER BY lower(u.username)`,
         [groupId],
       ),
-      this.pool.query<{
-        message_id: string;
-        sender_uuid: string;
-        sender_username: string;
-        body: string;
-        created_at: Date;
-      }>(
-        `SELECT m.message_id, m.sender_uuid, u.username AS sender_username, m.body, m.created_at
-         FROM group_messages m JOIN users u ON u.player_uuid = m.sender_uuid
-         WHERE m.group_id = $1 AND m.created_at < $2
-         ORDER BY m.created_at DESC, m.message_id DESC LIMIT 100`,
-        [groupId, before],
+      this.pool.query<ModerationMessageRow>(
+        `WITH selected AS (
+           SELECT m.message_id, m.sender_uuid, NULL::uuid AS recipient_uuid,
+                  COALESCE(m.sender_username_at_send, u.username) AS sender_username,
+                  m.body, m.created_at, m.state, m.edited_at, m.deleted_at, m.reply_to_message_id,
+                  m.attachment_kind, m.attachment_label
+           FROM group_messages m JOIN users u ON u.player_uuid = m.sender_uuid
+           WHERE m.group_id = $1 AND m.created_at < $2
+             AND ($3 = '' OR strpos(lower(m.body), $3) > 0)
+             AND ($4::uuid IS NULL OR m.sender_uuid = $4)
+             AND ($5 = 'ALL'
+               OR ($5 = 'LINKS' AND m.body ~* '(https?://|www\\.)')
+               OR ($5 = 'MENTIONS' AND m.body ~ '@[A-Za-z0-9_]{1,16}')
+               OR ($5 = 'ATTACHMENTS' AND m.attachment_kind IS NOT NULL))
+           ORDER BY
+             CASE WHEN $6::timestamptz IS NULL THEN 0
+               ELSE abs(extract(epoch FROM (m.created_at - $6::timestamptz))) END,
+             m.created_at DESC, m.message_id DESC
+           LIMIT 100
+         )
+         SELECT * FROM selected ORDER BY created_at, message_id`,
+        [groupId, before, search, senderUuid, filter, around],
       ),
+      this.pool.query<{ message_count: string; last_message_at: Date | null }>(
+        "SELECT count(*)::text AS message_count, max(created_at) AS last_message_at FROM group_messages WHERE group_id = $1",
+        [groupId],
+      ),
+      this.investigation(admin, "GROUP", groupId),
     ]);
     await this.auth.audit(admin.playerUuid, "ADMIN_GROUP_MESSAGES_VIEWED", "GROUP", groupId, {
       ip,
       resultCount: messages.rows.length,
+      search: search || undefined,
+      senderUuid: senderUuid || undefined,
+      filter,
+      around: around?.toISOString(),
     });
+    const groupStats = first(count.rows);
     return {
+      conversationId: groupId,
       group: {
         groupId: group.group_id,
         name: group.name,
         ownerUuid: group.owner_uuid,
-        members: members.rows.map((row) => ({ playerUuid: row.player_uuid, username: row.username })),
+        createdAt: group.created_at.toISOString(),
+        members: members.rows.map((row) => ({
+          playerUuid: row.player_uuid,
+          username: row.username,
+          role: row.player_uuid === group.owner_uuid ? "OWNER" : row.admin_role ?? "MEMBER",
+          accountCreatedAt: row.created_at.toISOString(),
+          lastSeenAt: row.last_seen_at?.toISOString() ?? null,
+        })),
       },
-      messages: messages.rows.reverse().map((row) => ({
-        messageId: row.message_id,
-        senderUuid: row.sender_uuid,
-        senderUsername: row.sender_username,
-        body: row.body,
-        createdAt: row.created_at.toISOString(),
-      })),
+      messageCount: Number(groupStats.message_count),
+      createdAt: group.created_at.toISOString(),
+      lastMessageAt: groupStats.last_message_at?.toISOString() ?? null,
+      messages: messages.rows.map(adminMessageJson),
+      ...investigation,
     };
   }
 
@@ -622,7 +756,10 @@ export class ModerationService {
     const result = await this.pool.query<ReportRow>(
       `SELECT report_id, kind, source_message_id, conversation_id, reporter_uuid, reporter_username,
               reported_uuid, reported_username, selected_body, selected_created_at, context_truncated,
-              reason, status, created_at, reviewed_at, reviewed_by
+              reason, status, created_at, reviewed_at, reviewed_by,
+              (SELECT count(*)::text FROM message_reports duplicate
+               WHERE duplicate.kind = message_reports.kind
+                 AND duplicate.source_message_id = message_reports.source_message_id) AS duplicate_count
        FROM message_reports WHERE status = $1 ORDER BY created_at DESC LIMIT 100`,
       [status],
     );
@@ -638,7 +775,10 @@ export class ModerationService {
     const reportResult = await this.pool.query<ReportRow>(
       `SELECT report_id, kind, source_message_id, conversation_id, reporter_uuid, reporter_username,
               reported_uuid, reported_username, selected_body, selected_created_at, context_truncated,
-              reason, status, created_at, reviewed_at, reviewed_by
+              reason, status, created_at, reviewed_at, reviewed_by,
+              (SELECT count(*)::text FROM message_reports duplicate
+               WHERE duplicate.kind = message_reports.kind
+                 AND duplicate.source_message_id = message_reports.source_message_id) AS duplicate_count
        FROM message_reports WHERE report_id = $1`,
       [reportId],
     );
@@ -651,21 +791,38 @@ export class ModerationService {
       sender_username: string;
       body: string;
       created_at: Date;
+      state: "SENT" | "EDITED" | "DELETED";
+      edited_at: Date | null;
+      deleted_at: Date | null;
+      reply_to_message_id: string | null;
+      attachment_kind: string | null;
+      attachment_label: string | null;
     }>(
-      `SELECT sequence_number, source_message_id, sender_uuid, sender_username, body, created_at
+      `SELECT sequence_number, source_message_id, sender_uuid, sender_username, body, created_at,
+              message_state AS state, edited_at, deleted_at,
+              reply_to_source_message_id AS reply_to_message_id, attachment_kind, attachment_label
        FROM message_report_context WHERE report_id = $1 ORDER BY sequence_number`,
       [reportId],
     );
     await this.auth.audit(admin.playerUuid, "ADMIN_REPORT_VIEWED", "REPORT", reportId, { ip });
+    const investigation = await this.investigation(admin, "REPORT", reportId);
     return {
       ...reportJson(report),
-      context: context.rows.map((row) => ({
-        messageId: row.source_message_id,
-        senderUuid: row.sender_uuid,
-        senderUsername: row.sender_username,
+      context: context.rows.map((row) => adminMessageJson({
+        message_id: row.source_message_id,
+        sender_uuid: row.sender_uuid,
+        recipient_uuid: null,
+        sender_username: row.sender_username,
         body: row.body,
-        createdAt: row.created_at.toISOString(),
+        created_at: row.created_at,
+        state: row.state,
+        edited_at: row.edited_at,
+        deleted_at: row.deleted_at,
+        reply_to_message_id: row.reply_to_message_id,
+        attachment_kind: row.attachment_kind,
+        attachment_label: row.attachment_label,
       })),
+      ...investigation,
     };
   }
 
@@ -684,6 +841,186 @@ export class ModerationService {
     if (!report) throw new ApiError(404, "REPORT_NOT_FOUND", "That report does not exist.");
     await this.auth.audit(admin.playerUuid, "ADMIN_REPORT_STATUS_CHANGED", "REPORT", reportId, { ip, status });
     return reportJson(report);
+  }
+
+  async setBookmark(
+    admin: AdminActor,
+    rawKind: unknown,
+    rawTargetId: unknown,
+    rawBookmarked: unknown,
+    ip: string,
+  ): Promise<{ bookmarked: boolean }> {
+    const kind = investigationKind(rawKind);
+    const targetId = investigationTarget(rawTargetId);
+    if (typeof rawBookmarked !== "boolean") {
+      throw new ApiError(400, "INVALID_BOOKMARK", "bookmarked must be true or false.");
+    }
+    if (rawBookmarked) {
+      await this.pool.query(
+        `INSERT INTO admin_conversation_bookmarks(admin_uuid, kind, conversation_id, resolved_at)
+         VALUES ($1, $2, $3, NULL)
+         ON CONFLICT (admin_uuid, kind, conversation_id)
+         DO UPDATE SET resolved_at = NULL, created_at = now()`,
+        [admin.playerUuid, kind, targetId],
+      );
+    } else {
+      await this.pool.query(
+        `UPDATE admin_conversation_bookmarks SET resolved_at = now()
+         WHERE admin_uuid = $1 AND kind = $2 AND conversation_id = $3`,
+        [admin.playerUuid, kind, targetId],
+      );
+    }
+    await this.auth.audit(admin.playerUuid, "ADMIN_BOOKMARK_CHANGED", kind, targetId, {
+      ip,
+      bookmarked: rawBookmarked,
+    });
+    return { bookmarked: rawBookmarked };
+  }
+
+  async addCaseNote(
+    admin: AdminActor,
+    rawTargetType: unknown,
+    rawTargetId: unknown,
+    rawBody: unknown,
+    ip: string,
+  ): Promise<unknown> {
+    const targetType = investigationKind(rawTargetType);
+    const targetId = investigationTarget(rawTargetId);
+    const note = caseNote(rawBody);
+    const noteId = randomUUID();
+    const result = await this.pool.query<{
+      note_id: string;
+      admin_uuid: string;
+      username: string;
+      body: string;
+      created_at: Date;
+      updated_at: Date;
+    }>(
+      `INSERT INTO admin_case_notes(note_id, admin_uuid, target_type, target_id, body)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING note_id, admin_uuid,
+         (SELECT username FROM users WHERE player_uuid = admin_uuid) AS username,
+         body, created_at, updated_at`,
+      [noteId, admin.playerUuid, targetType, targetId, note],
+    );
+    await this.auth.audit(admin.playerUuid, "ADMIN_CASE_NOTE_ADDED", targetType, targetId, {
+      ip,
+      noteId,
+    });
+    return noteJson(first(result.rows));
+  }
+
+  async deleteCaseNote(admin: AdminActor, rawNoteId: unknown, ip: string): Promise<void> {
+    const noteId = parseUuid(rawNoteId, "noteId");
+    const result = await this.pool.query<{ target_type: string; target_id: string }>(
+      `DELETE FROM admin_case_notes WHERE note_id = $1 AND admin_uuid = $2
+       RETURNING target_type, target_id`,
+      [noteId, admin.playerUuid],
+    );
+    const deleted = result.rows[0];
+    if (!deleted) throw new ApiError(404, "NOTE_NOT_FOUND", "That case note does not exist or belongs to another moderator.");
+    await this.auth.audit(admin.playerUuid, "ADMIN_CASE_NOTE_DELETED", deleted.target_type, deleted.target_id, {
+      ip,
+      noteId,
+    });
+  }
+
+  async setMessageStar(
+    admin: AdminActor,
+    rawKind: unknown,
+    rawMessageId: unknown,
+    rawStarred: unknown,
+    ip: string,
+  ): Promise<{ starred: boolean }> {
+    const kind = messageKind(rawKind);
+    const messageId = parseMessageId(rawMessageId);
+    if (typeof rawStarred !== "boolean") {
+      throw new ApiError(400, "INVALID_STAR", "starred must be true or false.");
+    }
+    if (rawStarred) {
+      await this.pool.query(
+        `INSERT INTO admin_message_stars(admin_uuid, kind, source_message_id)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        [admin.playerUuid, kind, messageId],
+      );
+    } else {
+      await this.pool.query(
+        "DELETE FROM admin_message_stars WHERE admin_uuid = $1 AND kind = $2 AND source_message_id = $3",
+        [admin.playerUuid, kind, messageId],
+      );
+    }
+    await this.auth.audit(admin.playerUuid, "ADMIN_MESSAGE_STAR_CHANGED", kind, messageId, {
+      ip,
+      starred: rawStarred,
+    });
+    return { starred: rawStarred };
+  }
+
+  async reportExport(admin: AdminActor, rawReportId: unknown, ip: string): Promise<unknown> {
+    const report = await this.report(admin, rawReportId, ip) as Record<string, unknown>;
+    const reportId = parseUuid(rawReportId, "reportId");
+    const context = Array.isArray(report.context)
+      ? (report.context as Array<Record<string, unknown>>).map((message) => ({
+        senderUsername: message.senderUsername,
+        body: message.body,
+        createdAt: message.createdAt,
+        state: message.state,
+        editedAt: message.editedAt,
+        attachmentKind: message.attachmentKind,
+        attachmentLabel: message.attachmentLabel,
+      }))
+      : [];
+    await this.auth.audit(admin.playerUuid, "ADMIN_REPORT_CONTEXT_EXPORTED", "REPORT", reportId, { ip });
+    return {
+      kind: report.kind,
+      reason: report.reason,
+      status: report.status,
+      reporterUsername: report.reporterUsername,
+      reportedUsername: report.reportedUsername,
+      createdAt: report.createdAt,
+      selectedCreatedAt: report.selectedCreatedAt,
+      context,
+    };
+  }
+
+  private async investigation(
+    admin: AdminActor,
+    kind: "DIRECT" | "GROUP" | "REPORT",
+    targetId: string,
+  ): Promise<Record<string, unknown>> {
+    const [bookmark, notes, stars] = await Promise.all([
+      this.pool.query(
+        `SELECT 1 FROM admin_conversation_bookmarks
+         WHERE admin_uuid = $1 AND kind = $2 AND conversation_id = $3 AND resolved_at IS NULL`,
+        [admin.playerUuid, kind, targetId],
+      ),
+      this.pool.query<{
+        note_id: string;
+        admin_uuid: string;
+        username: string;
+        body: string;
+        created_at: Date;
+        updated_at: Date;
+      }>(
+        `SELECT note.note_id, note.admin_uuid, users.username, note.body, note.created_at, note.updated_at
+         FROM admin_case_notes note JOIN users ON users.player_uuid = note.admin_uuid
+         WHERE note.target_type = $1 AND note.target_id = $2
+         ORDER BY note.created_at`,
+        [kind, targetId],
+      ),
+      kind === "REPORT"
+        ? Promise.resolve({ rows: [] as { source_message_id: string }[] })
+        : this.pool.query<{ source_message_id: string }>(
+          `SELECT source_message_id FROM admin_message_stars
+           WHERE admin_uuid = $1 AND kind = $2 ORDER BY created_at`,
+          [admin.playerUuid, kind],
+        ),
+    ]);
+    return {
+      bookmarked: bookmark.rowCount === 1,
+      notes: notes.rows.map(noteJson),
+      starredMessageIds: stars.rows.map((row) => row.source_message_id),
+    };
   }
 }
 
@@ -751,7 +1088,9 @@ async function directContext(
        UNION SELECT $3::bigint
        UNION SELECT $4::bigint
      )
-     SELECT m.message_id, m.sender_uuid, u.username AS sender_username, m.body, m.created_at
+     SELECT m.message_id, m.sender_uuid, COALESCE(m.sender_username_at_send, u.username) AS sender_username,
+            m.body, m.created_at, m.state, m.edited_at, m.deleted_at, m.reply_to_message_id,
+            m.attachment_kind, m.attachment_label
      FROM chosen JOIN messages m USING (message_id) JOIN users u ON u.player_uuid = m.sender_uuid
      ORDER BY m.message_id`,
     [low, high, previous, next, selected.message_id],
@@ -781,7 +1120,9 @@ async function groupContext(
        UNION SELECT $2::bigint
        UNION SELECT $3::bigint
      )
-     SELECT m.message_id, m.sender_uuid, u.username AS sender_username, m.body, m.created_at
+     SELECT m.message_id, m.sender_uuid, COALESCE(m.sender_username_at_send, u.username) AS sender_username,
+            m.body, m.created_at, m.state, m.edited_at, m.deleted_at, m.reply_to_message_id,
+            m.attachment_kind, m.attachment_label
      FROM chosen JOIN group_messages m USING (message_id) JOIN users u ON u.player_uuid = m.sender_uuid
      ORDER BY m.message_id`,
     [selected.group_id, previous, next, selected.message_id],
@@ -807,6 +1148,42 @@ function reportJson(row: ReportRow): Record<string, unknown> {
     createdAt: row.created_at.toISOString(),
     reviewedAt: row.reviewed_at?.toISOString() ?? null,
     reviewedBy: row.reviewed_by,
+    duplicateCount: Number(row.duplicate_count ?? "1"),
+  };
+}
+
+function adminMessageJson(row: ModerationMessageRow): Record<string, unknown> {
+  return {
+    messageId: row.message_id,
+    senderUuid: row.sender_uuid,
+    recipientUuid: row.recipient_uuid,
+    senderUsername: row.sender_username,
+    body: row.state === "DELETED" ? "" : row.body,
+    createdAt: row.created_at.toISOString(),
+    state: row.state,
+    editedAt: row.edited_at?.toISOString() ?? null,
+    deletedAt: row.deleted_at?.toISOString() ?? null,
+    replyToMessageId: row.reply_to_message_id,
+    attachmentKind: row.attachment_kind,
+    attachmentLabel: row.attachment_label,
+  };
+}
+
+function noteJson(row: {
+  note_id: string;
+  admin_uuid: string;
+  username: string;
+  body: string;
+  created_at: Date;
+  updated_at: Date;
+}): Record<string, unknown> {
+  return {
+    noteId: row.note_id,
+    authorUuid: row.admin_uuid,
+    authorUsername: row.username,
+    body: row.body,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
   };
 }
 
@@ -818,6 +1195,66 @@ function adminSearch(value: unknown): string {
     throw new ApiError(400, "INVALID_SEARCH", "Search text must contain at most 16 Minecraft username characters.");
   }
   return search;
+}
+
+function messageSearch(value: unknown): string {
+  if (value === undefined) return "";
+  if (typeof value !== "string") throw new ApiError(400, "INVALID_SEARCH", "Message search must be a string.");
+  const search = value.trim().toLowerCase();
+  if (search.length > 80) throw new ApiError(400, "INVALID_SEARCH", "Message search must be at most 80 characters.");
+  return search;
+}
+
+function optionalUuid(value: unknown, field: string): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  return parseUuid(value, field);
+}
+
+function messageFilter(value: unknown): "ALL" | "LINKS" | "MENTIONS" | "ATTACHMENTS" {
+  if (value === undefined || value === null || value === "") return "ALL";
+  if (typeof value !== "string") throw new ApiError(400, "INVALID_FILTER", "Message filter must be a string.");
+  const filter = value.trim().toUpperCase();
+  if (filter === "ALL" || filter === "LINKS" || filter === "MENTIONS" || filter === "ATTACHMENTS") return filter;
+  throw new ApiError(400, "INVALID_FILTER", "Message filter must be ALL, LINKS, MENTIONS, or ATTACHMENTS.");
+}
+
+function optionalDate(value: unknown, field: string): Date | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string") throw new ApiError(400, "INVALID_TIMESTAMP", `${field} must be an ISO timestamp.`);
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) throw new ApiError(400, "INVALID_TIMESTAMP", `${field} must be an ISO timestamp.`);
+  return date;
+}
+
+function investigationKind(value: unknown): "DIRECT" | "GROUP" | "REPORT" {
+  if (typeof value !== "string") throw new ApiError(400, "INVALID_TARGET", "Investigation kind must be a string.");
+  const kind = value.trim().toUpperCase();
+  if (kind === "DIRECT" || kind === "GROUP" || kind === "REPORT") return kind;
+  throw new ApiError(400, "INVALID_TARGET", "Investigation kind must be DIRECT, GROUP, or REPORT.");
+}
+
+function messageKind(value: unknown): "DIRECT" | "GROUP" {
+  const kind = investigationKind(value);
+  if (kind === "REPORT") throw new ApiError(400, "INVALID_TARGET", "Message kind must be DIRECT or GROUP.");
+  return kind;
+}
+
+function investigationTarget(value: unknown): string {
+  if (typeof value !== "string") throw new ApiError(400, "INVALID_TARGET", "Investigation target must be a string.");
+  const target = value.trim();
+  if (target.length < 1 || target.length > 100 || !/^[A-Za-z0-9:_-]+$/.test(target)) {
+    throw new ApiError(400, "INVALID_TARGET", "Investigation target is invalid.");
+  }
+  return target;
+}
+
+function caseNote(value: unknown): string {
+  if (typeof value !== "string") throw new ApiError(400, "INVALID_NOTE", "Case note must be a string.");
+  const note = value.trim();
+  if (note.length < 1 || note.length > 2000) {
+    throw new ApiError(400, "INVALID_NOTE", "Case note must contain 1-2000 characters.");
+  }
+  return note;
 }
 
 function cursorDate(value: unknown): Date {

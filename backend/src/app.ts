@@ -148,11 +148,24 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
       param(request, "firstUuid"),
       param(request, "secondUuid"),
       query(request, "before"),
+      query(request, "q"),
+      query(request, "sender"),
+      query(request, "filter"),
+      query(request, "around"),
       request.ip,
     ),
   );
   app.get("/v1/admin/groups/:groupId/messages", { preHandler: requireReadyAdmin }, async (request) =>
-    moderation.groupMessages(request.adminActor!, param(request, "groupId"), query(request, "before"), request.ip),
+    moderation.groupMessages(
+      request.adminActor!,
+      param(request, "groupId"),
+      query(request, "before"),
+      query(request, "q"),
+      query(request, "sender"),
+      query(request, "filter"),
+      query(request, "around"),
+      request.ip,
+    ),
   );
   app.get("/v1/admin/reports", { preHandler: requireReadyAdmin }, async (request) =>
     moderation.reports(request.adminActor!, query(request, "status"), request.ip),
@@ -168,6 +181,27 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
       request.ip,
     ),
   );
+  app.get("/v1/admin/reports/:reportId/export", { preHandler: requireReadyAdmin }, async (request) =>
+    moderation.reportExport(request.adminActor!, param(request, "reportId"), request.ip),
+  );
+  app.post("/v1/admin/investigations/bookmark", { preHandler: requireReadyAdmin }, async (request) => {
+    const data = body(request);
+    return moderation.setBookmark(request.adminActor!, data.kind, data.targetId, data.bookmarked, request.ip);
+  });
+  app.post("/v1/admin/investigations/notes", { preHandler: requireReadyAdmin }, async (request, reply) => {
+    const data = body(request);
+    return reply.status(201).send(
+      await moderation.addCaseNote(request.adminActor!, data.targetType, data.targetId, data.body, request.ip),
+    );
+  });
+  app.delete("/v1/admin/investigations/notes/:noteId", { preHandler: requireReadyAdmin }, async (request, reply) => {
+    await moderation.deleteCaseNote(request.adminActor!, param(request, "noteId"), request.ip);
+    return reply.status(204).send();
+  });
+  app.post("/v1/admin/investigations/star", { preHandler: requireReadyAdmin }, async (request) => {
+    const data = body(request);
+    return moderation.setMessageStar(request.adminActor!, data.kind, data.messageId, data.starred, request.ip);
+  });
 
   app.get("/v1/social", { preHandler: authenticate }, async (request) => social.snapshot(request.actor!));
   app.get(

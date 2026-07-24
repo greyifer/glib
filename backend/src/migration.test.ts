@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import type { Pool } from "pg";
 import type { RealtimeHub } from "./realtime.js";
-import { AdminAuthService, hashAdminPassword, ReportService } from "./moderation.js";
+import { AdminAuthService, hashAdminPassword, ModerationService, ReportService } from "./moderation.js";
 import { SocialService } from "./services.js";
 
 test("initial migration creates usable social tables and constraints", async () => {
@@ -130,11 +130,12 @@ test("typing events are transient, authenticated friend-only signals", async () 
 });
 
 test("group chats enforce membership, persistence, and the 20-player cap", async () => {
-  const database = new PGlite();
+    const database = new PGlite();
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
-    await database.exec(await readFile(resolve(migrationsDirectory, "001_initial.sql"), "utf8"));
-    await database.exec(await readFile(resolve(migrationsDirectory, "002_groups.sql"), "utf8"));
+    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql"]) {
+      await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
+    }
 
     const owner = "00000000-0000-4000-8000-000000000001";
     const friendUuids = Array.from({ length: 20 }, (_, index) =>
@@ -200,7 +201,7 @@ test("message reports snapshot the reported sender boundaries and all messages b
   const database = new PGlite();
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
-    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql"]) {
+    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql"]) {
       await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
     }
     const reporter = "00000000-0000-4000-8000-000000000001";
@@ -255,6 +256,97 @@ test("message reports snapshot the reported sender boundaries and all messages b
         "duplicate",
       ),
     );
+  } finally {
+    await database.close();
+  }
+});
+
+test("moderation investigations persist search metadata, bookmarks, notes, and stars", async () => {
+  const database = new PGlite();
+  try {
+    const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
+    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql"]) {
+      await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
+    }
+    const firstPlayer = "00000000-0000-4000-8000-000000000001";
+    const secondPlayer = "00000000-0000-4000-8000-000000000002";
+    await database.query(
+      `INSERT INTO users(player_uuid, username, normalized_username) VALUES
+       ($1, 'FirstNow', 'firstnow'), ($2, 'SecondNow', 'secondnow')`,
+      [firstPlayer, secondPlayer],
+    );
+    await database.query(
+      `INSERT INTO admin_accounts(player_uuid, role, password_hash, must_change_password)
+       VALUES ($1, 'MODERATOR', 'unused-test-hash', false)`,
+      [firstPlayer],
+    );
+    await database.query(
+      `INSERT INTO messages(client_message_id, sender_uuid, recipient_uuid, sender_username_at_send, body)
+       VALUES ('00000000-0000-4000-8000-000000000010', $1, $2, 'FirstOldName', 'snapshot keyword')`,
+      [firstPlayer, secondPlayer],
+    );
+
+    const query = async (sql: string, params?: unknown[]) => {
+      const result = await database.query(sql, params);
+      const affectedRows = "affectedRows" in result && typeof result.affectedRows === "number" ? result.affectedRows : 0;
+      return { ...result, rowCount: result.rows.length > 0 ? result.rows.length : affectedRows };
+    };
+    const client = { query, release: () => undefined };
+    const pool = { query, connect: async () => client } as unknown as Pool;
+    const auth = new AdminAuthService(pool, 30);
+    const moderation = new ModerationService(pool, auth);
+    const actor = {
+      playerUuid: firstPlayer,
+      username: "FirstNow",
+      role: "MODERATOR" as const,
+      mustChangePassword: false,
+    };
+    const history = await moderation.directMessages(
+      actor,
+      firstPlayer,
+      secondPlayer,
+      undefined,
+      "keyword",
+      undefined,
+      "ALL",
+      undefined,
+      "127.0.0.1",
+    ) as {
+      conversationId: string;
+      messages: Array<{ messageId: string; senderUsername: string }>;
+      bookmarked: boolean;
+      notes: unknown[];
+      starredMessageIds: string[];
+    };
+    assert.equal(history.messages[0]?.senderUsername, "FirstOldName");
+    assert.equal(history.bookmarked, false);
+
+    await moderation.setBookmark(actor, "DIRECT", history.conversationId, true, "127.0.0.1");
+    const note = await moderation.addCaseNote(
+      actor, "DIRECT", history.conversationId, "Private factual note", "127.0.0.1",
+    ) as { body: string };
+    assert.equal(note.body, "Private factual note");
+    await moderation.setMessageStar(
+      actor, "DIRECT", String(history.messages[0]!.messageId), true, "127.0.0.1",
+    );
+    const reloaded = await moderation.directMessages(
+      actor,
+      firstPlayer,
+      secondPlayer,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "127.0.0.1",
+    ) as {
+      bookmarked: boolean;
+      notes: Array<{ body: string }>;
+      starredMessageIds: string[];
+    };
+    assert.equal(reloaded.bookmarked, true);
+    assert.equal(reloaded.notes[0]?.body, "Private factual note");
+    assert.equal(reloaded.starredMessageIds.length, 1);
   } finally {
     await database.close();
   }

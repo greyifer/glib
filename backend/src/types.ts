@@ -21,9 +21,16 @@ export interface ChatMessage {
   clientMessageId: string;
   senderUuid: string;
   recipientUuid: string;
+  senderUsernameAtSend: string;
   body: string;
   createdAt: string;
   readAt: string | null;
+  state: "SENT" | "EDITED" | "DELETED";
+  editedAt: string | null;
+  deletedAt: string | null;
+  replyToMessageId: string | null;
+  attachmentKind: string | null;
+  attachmentLabel: string | null;
 }
 
 export interface GroupSummary {
@@ -39,8 +46,15 @@ export interface GroupChatMessage {
   clientMessageId: string;
   groupId: string;
   senderUuid: string;
+  senderUsernameAtSend: string;
   body: string;
   createdAt: string;
+  state: "SENT" | "EDITED" | "DELETED";
+  editedAt: string | null;
+  deletedAt: string | null;
+  replyToMessageId: string | null;
+  attachmentKind: string | null;
+  attachmentLabel: string | null;
 }
 
 declare module "fastify" {
