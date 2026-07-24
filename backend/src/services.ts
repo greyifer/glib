@@ -8,13 +8,15 @@ import {
   normalizeUsername,
   orderedPair,
   parseClientMessageId,
+  parsePresenceStatus,
   parseUuid,
   randomToken,
+  validateGroupName,
   validateMessage,
 } from "./domain.js";
 import { verifyMinecraftJoin, type VerifiedMinecraftProfile } from "./minecraft.js";
 import type { RealtimeHub } from "./realtime.js";
-import type { Actor, ChatMessage, PublicPlayer } from "./types.js";
+import type { Actor, ChatMessage, GroupChatMessage, GroupSummary, PublicPlayer } from "./types.js";
 
 interface ChallengeRow {
   username: string;
@@ -52,11 +54,29 @@ interface PlayerSearchRow extends ActorRow {
   request_id: string | null;
 }
 
+interface GroupDetailsRow extends PlayerRow {
+  group_id: string;
+  group_name: string;
+  owner_uuid: string;
+  group_created_at: Date;
+}
+
+interface GroupMessageRow {
+  message_id: string;
+  client_message_id: string;
+  group_id: string;
+  sender_uuid: string;
+  body: string;
+  created_at: Date;
+}
+
 function publicPlayer(row: PlayerRow, realtime: RealtimeHub): PublicPlayer {
+  const status = realtime.status(row.player_uuid);
   return {
     playerUuid: row.player_uuid,
     username: row.username,
-    online: realtime.isOnline(row.player_uuid),
+    online: status !== "OFFLINE",
+    status,
     lastSeenAt: row.last_seen_at?.toISOString() ?? null,
   };
 }
@@ -70,6 +90,17 @@ function chatMessage(row: MessageRow): ChatMessage {
     body: row.body,
     createdAt: row.created_at.toISOString(),
     readAt: row.read_at?.toISOString() ?? null,
+  };
+}
+
+function groupChatMessage(row: GroupMessageRow): GroupChatMessage {
+  return {
+    messageId: row.message_id,
+    clientMessageId: row.client_message_id,
+    groupId: row.group_id,
+    senderUuid: row.sender_uuid,
+    body: row.body,
+    createdAt: row.created_at.toISOString(),
   };
 }
 
@@ -184,7 +215,7 @@ export class SocialService {
   ) {}
 
   async snapshot(actor: Actor): Promise<unknown> {
-    const [friends, incoming, outgoing, blocked] = await Promise.all([
+    const [friends, incoming, outgoing, blocked, groups] = await Promise.all([
       this.pool.query<PlayerRow & { friends_since: Date }>(
         `SELECT u.player_uuid, u.username, u.last_seen_at, f.created_at AS friends_since
          FROM friendships f
@@ -210,6 +241,7 @@ export class SocialService {
          WHERE b.blocker_uuid = $1 ORDER BY lower(u.username)`,
         [actor.playerUuid],
       ),
+      this.groups(actor),
     ]);
 
     const request = (row: RequestRow) => ({
@@ -229,6 +261,7 @@ export class SocialService {
         ...publicPlayer(row, this.realtime),
         blockedAt: row.blocked_at.toISOString(),
       })),
+      groups,
     };
   }
 
@@ -311,7 +344,13 @@ export class SocialService {
 
     const event = {
       requestId,
-      player: { playerUuid: actor.playerUuid, username: actor.username, online: true, lastSeenAt: null },
+      player: {
+        playerUuid: actor.playerUuid,
+        username: actor.username,
+        online: this.realtime.isOnline(actor.playerUuid),
+        status: this.realtime.status(actor.playerUuid),
+        lastSeenAt: null,
+      },
       createdAt: new Date().toISOString(),
     };
     this.realtime.send(target.player_uuid, "friend.request", event);
@@ -344,7 +383,13 @@ export class SocialService {
     });
 
     this.realtime.send(sender.player_uuid, "friend.accepted", {
-      player: { playerUuid: actor.playerUuid, username: actor.username, online: true, lastSeenAt: null },
+      player: {
+        playerUuid: actor.playerUuid,
+        username: actor.username,
+        online: this.realtime.isOnline(actor.playerUuid),
+        status: this.realtime.status(actor.playerUuid),
+        lastSeenAt: null,
+      },
     });
     return { playerUuid: sender.player_uuid, username: sender.username };
   }
@@ -457,8 +502,261 @@ export class SocialService {
     return message;
   }
 
+  async sendTyping(actor: Actor, rawTargetUuid: unknown, rawTyping: unknown): Promise<void> {
+    const targetUuid = parseUuid(rawTargetUuid);
+    if (typeof rawTyping !== "boolean") {
+      throw new ApiError(400, "INVALID_TYPING_STATE", "typing must be true or false.");
+    }
+    await this.assertFriends(this.pool, actor.playerUuid, targetUuid);
+    await this.assertNotBlocked(this.pool, actor.playerUuid, targetUuid);
+    this.realtime.send(targetUuid, "chat.typing", {
+      playerUuid: actor.playerUuid,
+      username: actor.username,
+      typing: rawTyping,
+    });
+  }
+
+  async setPresence(actor: Actor, rawStatus: unknown): Promise<void> {
+    await this.realtime.setStatus(actor, parsePresenceStatus(rawStatus));
+  }
+
+  async groups(actor: Actor): Promise<GroupSummary[]> {
+    return this.loadGroups(actor.playerUuid, null);
+  }
+
+  async group(actor: Actor, rawGroupId: unknown): Promise<GroupSummary> {
+    const groupId = parseUuid(rawGroupId, "groupId");
+    const group = (await this.loadGroups(actor.playerUuid, groupId))[0];
+    if (!group) throw new ApiError(404, "GROUP_NOT_FOUND", "That group does not exist or you are not a member.");
+    return group;
+  }
+
+  async createGroup(actor: Actor, rawName: unknown, rawMemberUuids: unknown): Promise<GroupSummary> {
+    const name = validateGroupName(rawName);
+    const memberUuids = this.parseGroupMembers(actor.playerUuid, rawMemberUuids);
+    const groupId = randomUUID();
+    await transaction(this.pool, async (client) => {
+      for (const memberUuid of memberUuids) {
+        await this.assertFriends(client, actor.playerUuid, memberUuid);
+        await this.assertNotBlocked(client, actor.playerUuid, memberUuid);
+      }
+      await client.query(
+        "INSERT INTO chat_groups(group_id, name, owner_uuid) VALUES ($1, $2, $3)",
+        [groupId, name, actor.playerUuid],
+      );
+      await client.query(
+        "INSERT INTO group_members(group_id, player_uuid) VALUES ($1, $2)",
+        [groupId, actor.playerUuid],
+      );
+      for (const memberUuid of memberUuids) {
+        await client.query(
+          "INSERT INTO group_members(group_id, player_uuid) VALUES ($1, $2)",
+          [groupId, memberUuid],
+        );
+      }
+    });
+    const group = await this.group(actor, groupId);
+    await this.realtime.sendToGroup(groupId, "group.created", group);
+    return group;
+  }
+
+  async renameGroup(actor: Actor, rawGroupId: unknown, rawName: unknown): Promise<GroupSummary> {
+    const groupId = parseUuid(rawGroupId, "groupId");
+    const name = validateGroupName(rawName);
+    await this.assertGroupMember(this.pool, groupId, actor.playerUuid);
+    await this.pool.query("UPDATE chat_groups SET name = $1 WHERE group_id = $2", [name, groupId]);
+    const group = await this.group(actor, groupId);
+    await this.realtime.sendToGroup(groupId, "group.updated", group);
+    return group;
+  }
+
+  async addGroupMember(actor: Actor, rawGroupId: unknown, rawPlayerUuid: unknown): Promise<GroupSummary> {
+    const groupId = parseUuid(rawGroupId, "groupId");
+    const playerUuid = parseUuid(rawPlayerUuid);
+    if (playerUuid === actor.playerUuid) throw new ApiError(409, "ALREADY_GROUP_MEMBER", "You are already in this group.");
+    await transaction(this.pool, async (client) => {
+      const locked = await client.query(
+        `SELECT g.group_id FROM chat_groups g
+         JOIN group_members mine ON mine.group_id = g.group_id AND mine.player_uuid = $2
+         WHERE g.group_id = $1 FOR UPDATE OF g`,
+        [groupId, actor.playerUuid],
+      );
+      if (locked.rowCount !== 1) throw new ApiError(404, "GROUP_NOT_FOUND", "That group does not exist or you are not a member.");
+      await this.assertFriends(client, actor.playerUuid, playerUuid);
+      await this.assertNotBlocked(client, actor.playerUuid, playerUuid);
+      const existing = await client.query(
+        "SELECT 1 FROM group_members WHERE group_id = $1 AND player_uuid = $2",
+        [groupId, playerUuid],
+      );
+      if (existing.rowCount) throw new ApiError(409, "ALREADY_GROUP_MEMBER", "That player is already in this group.");
+      const count = await client.query<{ member_count: string }>(
+        "SELECT count(*)::text AS member_count FROM group_members WHERE group_id = $1",
+        [groupId],
+      );
+      if (Number(first(count.rows).member_count) >= 20) {
+        throw new ApiError(409, "GROUP_FULL", "Groups can contain at most 20 players.");
+      }
+      await client.query(
+        "INSERT INTO group_members(group_id, player_uuid) VALUES ($1, $2)",
+        [groupId, playerUuid],
+      );
+    });
+    const group = await this.group(actor, groupId);
+    await this.realtime.sendToGroup(groupId, "group.updated", group);
+    return group;
+  }
+
+  async removeGroupMember(actor: Actor, rawGroupId: unknown, rawPlayerUuid: unknown): Promise<void> {
+    const groupId = parseUuid(rawGroupId, "groupId");
+    const playerUuid = parseUuid(rawPlayerUuid);
+    const remainingPlayerUuid = await transaction(this.pool, async (client) => {
+      const groupResult = await client.query<{ owner_uuid: string }>(
+        `SELECT g.owner_uuid FROM chat_groups g
+         JOIN group_members mine ON mine.group_id = g.group_id AND mine.player_uuid = $2
+         WHERE g.group_id = $1 FOR UPDATE OF g`,
+        [groupId, actor.playerUuid],
+      );
+      const group = groupResult.rows[0];
+      if (!group) throw new ApiError(404, "GROUP_NOT_FOUND", "That group does not exist or you are not a member.");
+      if (playerUuid !== actor.playerUuid && group.owner_uuid !== actor.playerUuid) {
+        throw new ApiError(403, "GROUP_OWNER_REQUIRED", "Only the group owner can remove another member.");
+      }
+      const removed = await client.query(
+        "DELETE FROM group_members WHERE group_id = $1 AND player_uuid = $2",
+        [groupId, playerUuid],
+      );
+      if (removed.rowCount !== 1) throw new ApiError(404, "GROUP_MEMBER_NOT_FOUND", "That player is not in this group.");
+
+      const remaining = await client.query<{ player_uuid: string }>(
+        "SELECT player_uuid FROM group_members WHERE group_id = $1 ORDER BY joined_at, player_uuid LIMIT 1",
+        [groupId],
+      );
+      const next = remaining.rows[0]?.player_uuid ?? null;
+      if (group.owner_uuid === playerUuid) {
+        if (next) await client.query("UPDATE chat_groups SET owner_uuid = $1 WHERE group_id = $2", [next, groupId]);
+        else await client.query("DELETE FROM chat_groups WHERE group_id = $1", [groupId]);
+      }
+      return next;
+    });
+
+    this.realtime.send(playerUuid, "group.removed", { groupId });
+    if (remainingPlayerUuid) {
+      const group = (await this.loadGroups(remainingPlayerUuid, groupId))[0];
+      if (group) await this.realtime.sendToGroup(groupId, "group.updated", group);
+    }
+  }
+
+  async groupMessages(actor: Actor, rawGroupId: unknown, rawBefore: unknown): Promise<GroupChatMessage[]> {
+    const groupId = parseUuid(rawGroupId, "groupId");
+    await this.assertGroupMember(this.pool, groupId, actor.playerUuid);
+    let before = new Date();
+    if (typeof rawBefore === "string") {
+      before = new Date(rawBefore);
+      if (Number.isNaN(before.getTime())) throw new ApiError(400, "INVALID_CURSOR", "before must be an ISO timestamp.");
+    }
+    const result = await this.pool.query<GroupMessageRow>(
+      `SELECT message_id, client_message_id, group_id, sender_uuid, body, created_at
+       FROM group_messages WHERE group_id = $1 AND created_at < $2
+       ORDER BY created_at DESC LIMIT 100`,
+      [groupId, before],
+    );
+    return result.rows.reverse().map(groupChatMessage);
+  }
+
+  async sendGroupMessage(actor: Actor, rawGroupId: unknown, rawClientMessageId: unknown, rawBody: unknown): Promise<GroupChatMessage> {
+    const groupId = parseUuid(rawGroupId, "groupId");
+    const clientMessageId = parseClientMessageId(rawClientMessageId);
+    const body = validateMessage(rawBody);
+    await this.assertGroupMember(this.pool, groupId, actor.playerUuid);
+    const result = await this.pool.query<GroupMessageRow>(
+      `INSERT INTO group_messages(group_id, client_message_id, sender_uuid, body)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (sender_uuid, client_message_id) DO UPDATE SET body = group_messages.body
+       WHERE group_messages.group_id = EXCLUDED.group_id AND group_messages.body = EXCLUDED.body
+       RETURNING message_id, client_message_id, group_id, sender_uuid, body, created_at`,
+      [groupId, clientMessageId, actor.playerUuid, body],
+    );
+    if (result.rowCount !== 1) {
+      throw new ApiError(409, "CLIENT_MESSAGE_ID_REUSED", "That client message ID was already used for different content.");
+    }
+    const message = groupChatMessage(first(result.rows));
+    await this.realtime.sendToGroup(groupId, "group.message", message);
+    return message;
+  }
+
+  async sendGroupTyping(actor: Actor, rawGroupId: unknown, rawTyping: unknown): Promise<void> {
+    const groupId = parseUuid(rawGroupId, "groupId");
+    if (typeof rawTyping !== "boolean") {
+      throw new ApiError(400, "INVALID_TYPING_STATE", "typing must be true or false.");
+    }
+    await this.assertGroupMember(this.pool, groupId, actor.playerUuid);
+    await this.realtime.sendToGroup(groupId, "group.typing", {
+      groupId,
+      playerUuid: actor.playerUuid,
+      username: actor.username,
+      typing: rawTyping,
+    }, actor.playerUuid);
+  }
+
   async cleanMessages(retentionDays: number): Promise<void> {
-    await this.pool.query("DELETE FROM messages WHERE created_at < now() - ($1 * interval '1 day')", [retentionDays]);
+    await Promise.all([
+      this.pool.query("DELETE FROM messages WHERE created_at < now() - ($1 * interval '1 day')", [retentionDays]),
+      this.pool.query("DELETE FROM group_messages WHERE created_at < now() - ($1 * interval '1 day')", [retentionDays]),
+    ]);
+  }
+
+  private async loadGroups(playerUuid: string, groupId: string | null): Promise<GroupSummary[]> {
+    const result = await this.pool.query<GroupDetailsRow>(
+      `SELECT g.group_id, g.name AS group_name, g.owner_uuid, g.created_at AS group_created_at,
+              u.player_uuid, u.username, u.last_seen_at
+       FROM group_members mine
+       JOIN chat_groups g ON g.group_id = mine.group_id
+       JOIN group_members member ON member.group_id = g.group_id
+       JOIN users u ON u.player_uuid = member.player_uuid
+       WHERE mine.player_uuid = $1 AND ($2::uuid IS NULL OR g.group_id = $2)
+       ORDER BY g.created_at DESC, lower(u.username)`,
+      [playerUuid, groupId],
+    );
+    const groups = new Map<string, GroupSummary>();
+    for (const row of result.rows) {
+      let group = groups.get(row.group_id);
+      if (!group) {
+        group = {
+          groupId: row.group_id,
+          name: row.group_name,
+          ownerUuid: row.owner_uuid,
+          members: [],
+          createdAt: row.group_created_at.toISOString(),
+        };
+        groups.set(row.group_id, group);
+      }
+      group.members.push(publicPlayer(row, this.realtime));
+    }
+    return [...groups.values()];
+  }
+
+  private parseGroupMembers(actorUuid: string, rawMemberUuids: unknown): string[] {
+    if (!Array.isArray(rawMemberUuids)) {
+      throw new ApiError(400, "INVALID_GROUP_MEMBERS", "memberUuids must be a list.");
+    }
+    const members = new Set<string>();
+    for (const rawUuid of rawMemberUuids) {
+      const playerUuid = parseUuid(rawUuid);
+      if (playerUuid === actorUuid) throw new ApiError(400, "SELF_TARGET", "You are added to groups automatically.");
+      members.add(playerUuid);
+    }
+    if (members.size === 0) throw new ApiError(400, "GROUP_MEMBERS_REQUIRED", "Choose at least one friend for the group.");
+    if (members.size > 19) throw new ApiError(400, "GROUP_FULL", "Groups can contain at most 20 players.");
+    return [...members];
+  }
+
+  private async assertGroupMember(client: Pool | PoolClient, groupId: string, playerUuid: string): Promise<void> {
+    if (!(await client.query(
+      "SELECT 1 FROM group_members WHERE group_id = $1 AND player_uuid = $2",
+      [groupId, playerUuid],
+    )).rowCount) {
+      throw new ApiError(403, "NOT_GROUP_MEMBER", "You are not a member of this group.");
+    }
   }
 
   private async assertFriends(client: Pool | PoolClient, firstUuid: string, secondUuid: string): Promise<void> {

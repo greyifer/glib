@@ -5,6 +5,7 @@ export interface Config {
   port: number;
   logLevel: string;
   sessionTtlHours: number;
+  adminSessionTtlMinutes: number;
   messageRetentionDays: number;
   trustProxy: boolean;
 }
@@ -42,6 +43,7 @@ export function loadConfig(): Config {
     port: integer("PORT", 8080, 1, 65535),
     logLevel: process.env.LOG_LEVEL?.trim() || "info",
     sessionTtlHours: integer("SESSION_TTL_HOURS", 12, 1, 168),
+    adminSessionTtlMinutes: integer("ADMIN_SESSION_TTL_MINUTES", 30, 5, 120),
     messageRetentionDays: integer("MESSAGE_RETENTION_DAYS", 90, 1, 3650),
     trustProxy: boolean("TRUST_PROXY", false),
   };
