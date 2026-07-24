@@ -737,13 +737,13 @@ export class SocialService {
   async cleanMessages(retentionDays: number): Promise<void> {
     await Promise.all([
       this.pool.query(
-        `UPDATE messages SET body = '', state = 'DELETED', deleted_at = COALESCE(deleted_at, now()),
+        `UPDATE messages SET body = '[removed]', state = 'DELETED', deleted_at = COALESCE(deleted_at, now()),
             attachment_kind = NULL, attachment_label = NULL
          WHERE created_at < now() - ($1 * interval '1 day') AND state <> 'DELETED'`,
         [retentionDays],
       ),
       this.pool.query(
-        `UPDATE group_messages SET body = '', state = 'DELETED', deleted_at = COALESCE(deleted_at, now()),
+        `UPDATE group_messages SET body = '[removed]', state = 'DELETED', deleted_at = COALESCE(deleted_at, now()),
             attachment_kind = NULL, attachment_label = NULL
          WHERE created_at < now() - ($1 * interval '1 day') AND state <> 'DELETED'`,
         [retentionDays],

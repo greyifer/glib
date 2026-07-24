@@ -347,6 +347,14 @@ test("moderation investigations persist search metadata, bookmarks, notes, and s
     assert.equal(reloaded.bookmarked, true);
     assert.equal(reloaded.notes[0]?.body, "Private factual note");
     assert.equal(reloaded.starredMessageIds.length, 1);
+
+    await database.query("UPDATE messages SET created_at = now() - interval '40 days'");
+    const social = new SocialService(pool, {} as RealtimeHub);
+    await social.cleanMessages(30);
+    const tombstone = await database.query<{ body: string; state: string }>(
+      "SELECT body, state FROM messages LIMIT 1",
+    );
+    assert.deepEqual(tombstone.rows[0], { body: "[removed]", state: "DELETED" });
   } finally {
     await database.close();
   }
