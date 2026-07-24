@@ -13,12 +13,15 @@ try {
 
   if (action === "grant") {
     const suppliedPassword = process.env.ADMIN_INITIAL_PASSWORD;
+    const pipedPasswords = process.env.ADMIN_PASSWORD_STDIN === "1"
+      ? await readPasswordPairFromStdin()
+      : undefined;
     const password = validatePassword(
-      suppliedPassword ?? await readHidden("Initial password: "),
+      suppliedPassword ?? pipedPasswords?.[0] ?? await readHidden("Initial password: "),
       "initial password",
     );
     if (suppliedPassword === undefined) {
-      const confirmation = await readHidden("Confirm initial password: ");
+      const confirmation = pipedPasswords?.[1] ?? await readHidden("Confirm initial password: ");
       if (password !== confirmation) throw new Error("The passwords did not match");
     }
     const role = process.env.ADMIN_ROLE?.trim().toUpperCase() || "MODERATOR";
@@ -55,9 +58,26 @@ try {
   await pool.end();
 }
 
+async function readPasswordPairFromStdin(): Promise<readonly [string, string]> {
+  if (process.stdin.isTTY) {
+    throw new Error("ADMIN_PASSWORD_STDIN requires a redirected stdin pipe.");
+  }
+
+  process.stdin.setEncoding("utf8");
+  let input = "";
+  for await (const chunk of process.stdin) {
+    input += chunk;
+    if (input.length > 520) throw new Error("The password input exceeded the allowed size.");
+  }
+
+  const lines = input.replace(/\r\n/g, "\n").split("\n");
+  if (lines.length < 2) throw new Error("The password input was incomplete.");
+  return [lines[0] ?? "", lines[1] ?? ""];
+}
+
 function readHidden(prompt: string): Promise<string> {
   if (!process.stdin.isTTY || !process.stdout.isTTY || typeof process.stdin.setRawMode !== "function") {
-    throw new Error("A TTY is required for the hidden password prompt. Use a temporary ADMIN_INITIAL_PASSWORD environment variable.");
+    throw new Error("A TTY is required for the hidden password prompt. Use the G'Network Admin secure-input flow.");
   }
   return new Promise((resolve, reject) => {
     let value = "";
