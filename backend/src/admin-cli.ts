@@ -81,9 +81,13 @@ function readHidden(prompt: string): Promise<string> {
           return;
         }
         if (character === "\u0008" || character === "\u007f") {
-          value = value.slice(0, -1);
+          if (value.length > 0) {
+            value = value.slice(0, -1);
+            process.stdout.write("\b \b");
+          }
         } else if (character >= " " && value.length < 128) {
           value += character;
+          process.stdout.write("*");
         }
       }
     };
