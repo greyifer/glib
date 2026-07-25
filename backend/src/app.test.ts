@@ -15,7 +15,13 @@ test("moderator routes require both a moderator token and its matching Minecraft
   let app: Awaited<ReturnType<typeof createApp>> | undefined;
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
-    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql"]) {
+    for (const file of [
+      "001_initial.sql",
+      "002_groups.sql",
+      "003_moderation.sql",
+      "004_investigations.sql",
+      "005_social_access_restrictions.sql",
+    ]) {
       await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
     }
     const moderator = "00000000-0000-4000-8000-000000000001";
@@ -103,6 +109,75 @@ test("moderator routes require both a moderator token and its matching Minecraft
     assert.deepEqual(
       (authorized.json() as Array<{ username: string }>).map((user) => user.username),
       ["Moderator", "NormalUser"],
+    );
+
+    const disabled = await app.inject({
+      method: "PATCH",
+      url: `/v1/admin/users/${normalUser}/social-access`,
+      headers: {
+        authorization: `Bearer ${moderatorToken}`,
+        "x-glib-admin-authorization": `Bearer ${unlockedToken}`,
+      },
+      payload: { enabled: false, reason: "Temporary moderation restriction" },
+    });
+    assert.equal(disabled.statusCode, 200);
+    assert.equal(disabled.json().enabled, false);
+
+    const blockedSocial = await app.inject({
+      method: "GET",
+      url: "/v1/social",
+      headers: { authorization: `Bearer ${normalToken}` },
+    });
+    assert.equal(blockedSocial.statusCode, 403);
+    assert.equal(blockedSocial.json().error.code, "SOCIAL_ACCESS_DISABLED");
+
+    const stillCanCheckAdminAccess = await app.inject({
+      method: "GET",
+      url: "/v1/admin/access",
+      headers: { authorization: `Bearer ${normalToken}` },
+    });
+    assert.equal(stillCanCheckAdminAccess.statusCode, 200);
+
+    const selfRestriction = await app.inject({
+      method: "PATCH",
+      url: `/v1/admin/users/${moderator}/social-access`,
+      headers: {
+        authorization: `Bearer ${moderatorToken}`,
+        "x-glib-admin-authorization": `Bearer ${unlockedToken}`,
+      },
+      payload: { enabled: false, reason: "Should be rejected" },
+    });
+    assert.equal(selfRestriction.statusCode, 403);
+    assert.equal(selfRestriction.json().error.code, "SOCIAL_ACCESS_SELF_TARGET");
+
+    const restored = await app.inject({
+      method: "PATCH",
+      url: `/v1/admin/users/${normalUser}/social-access`,
+      headers: {
+        authorization: `Bearer ${moderatorToken}`,
+        "x-glib-admin-authorization": `Bearer ${unlockedToken}`,
+      },
+      payload: { enabled: true, reason: "Restriction reviewed and cleared" },
+    });
+    assert.equal(restored.statusCode, 200);
+    assert.equal(restored.json().enabled, true);
+
+    const socialAfterRestore = await app.inject({
+      method: "GET",
+      url: "/v1/social",
+      headers: { authorization: `Bearer ${normalToken}` },
+    });
+    assert.equal(socialAfterRestore.statusCode, 200);
+
+    const audit = await database.query<{ action: string }>(
+      `SELECT action FROM admin_audit_log
+       WHERE target_id = $1 AND action LIKE 'ADMIN_SOCIAL_ACCESS_%'
+       ORDER BY audit_id`,
+      [normalUser],
+    );
+    assert.deepEqual(
+      audit.rows.map((row) => row.action),
+      ["ADMIN_SOCIAL_ACCESS_DISABLED", "ADMIN_SOCIAL_ACCESS_RESTORED"],
     );
   } finally {
     if (app) await app.close();

@@ -13,6 +13,8 @@ import {
   validatePassword,
   validateReportReason,
 } from "./domain.js";
+import type { RealtimeHub } from "./realtime.js";
+import { socialAccessState, type SocialAccessState } from "./social-access.js";
 import type { Actor, AdminActor } from "./types.js";
 
 const SCRYPT_N = 16_384;
@@ -428,6 +430,7 @@ export class ModerationService {
   constructor(
     private readonly pool: Pool,
     private readonly auth: AdminAuthService,
+    private readonly realtime: RealtimeHub | null = null,
   ) {}
 
   async users(admin: AdminActor, rawSearch: unknown, ip: string): Promise<unknown[]> {
@@ -440,11 +443,16 @@ export class ModerationService {
       last_seen_at: Date | null;
       direct_count: string;
       group_count: string;
+      social_access_enabled: boolean;
     }>(
       `SELECT u.player_uuid, u.username, u.created_at, u.last_authenticated_at, u.last_seen_at,
           (SELECT count(DISTINCT CASE WHEN m.sender_uuid = u.player_uuid THEN m.recipient_uuid ELSE m.sender_uuid END)::text
            FROM messages m WHERE m.sender_uuid = u.player_uuid OR m.recipient_uuid = u.player_uuid) AS direct_count,
-          (SELECT count(*)::text FROM group_members gm WHERE gm.player_uuid = u.player_uuid) AS group_count
+          (SELECT count(*)::text FROM group_members gm WHERE gm.player_uuid = u.player_uuid) AS group_count,
+          NOT EXISTS (
+            SELECT 1 FROM social_access_restrictions restriction
+            WHERE restriction.player_uuid = u.player_uuid AND restriction.restored_at IS NULL
+          ) AS social_access_enabled
        FROM users u
        WHERE ($1 = '' OR strpos(lower(u.username), $1) > 0)
        ORDER BY lower(u.username), u.player_uuid
@@ -463,6 +471,7 @@ export class ModerationService {
       lastSeenAt: row.last_seen_at?.toISOString() ?? null,
       directCount: Number(row.direct_count),
       groupCount: Number(row.group_count),
+      socialAccessEnabled: row.social_access_enabled,
     }));
   }
 
@@ -474,14 +483,19 @@ export class ModerationService {
       created_at: Date;
       last_authenticated_at: Date;
       last_seen_at: Date | null;
+      admin_role: "MODERATOR" | "OWNER" | null;
     }>(
-      `SELECT player_uuid, username, created_at, last_authenticated_at, last_seen_at
-       FROM users WHERE player_uuid = $1`,
+      `SELECT users.player_uuid, users.username, users.created_at, users.last_authenticated_at, users.last_seen_at,
+              admin_accounts.role AS admin_role
+       FROM users
+       LEFT JOIN admin_accounts
+         ON admin_accounts.player_uuid = users.player_uuid AND admin_accounts.disabled_at IS NULL
+       WHERE users.player_uuid = $1`,
       [playerUuid],
     );
     const user = userResult.rows[0];
     if (!user) throw new ApiError(404, "PLAYER_NOT_FOUND", "That G'Lib player does not exist.");
-    const [directs, groups] = await Promise.all([
+    const [directs, groups, access] = await Promise.all([
       this.pool.query<{
         player_uuid: string;
         username: string;
@@ -518,6 +532,7 @@ export class ModerationService {
          ORDER BY last_message_at DESC NULLS LAST, lower(g.name)`,
         [playerUuid],
       ),
+      socialAccessState(this.pool, playerUuid),
     ]);
     await this.auth.audit(admin.playerUuid, "ADMIN_USER_VIEWED", "USER", playerUuid, { ip });
     return {
@@ -527,6 +542,10 @@ export class ModerationService {
         createdAt: user.created_at.toISOString(),
         lastAuthenticatedAt: user.last_authenticated_at.toISOString(),
         lastSeenAt: user.last_seen_at?.toISOString() ?? null,
+      },
+      socialAccess: {
+        ...access,
+        canModify: canManageSocialAccess(admin, playerUuid, user.admin_role),
       },
       directConversations: directs.rows.map((row) => ({
         playerUuid: row.player_uuid,
@@ -543,6 +562,86 @@ export class ModerationService {
         messageCount: Number(row.message_count),
         lastMessageAt: row.last_message_at?.toISOString() ?? null,
       })),
+    };
+  }
+
+  async setSocialAccess(
+    admin: AdminActor,
+    rawPlayerUuid: unknown,
+    rawEnabled: unknown,
+    rawReason: unknown,
+    ip: string,
+  ): Promise<SocialAccessState & { canModify: boolean }> {
+    const playerUuid = parseUuid(rawPlayerUuid);
+    if (typeof rawEnabled !== "boolean") {
+      throw new ApiError(400, "INVALID_SOCIAL_ACCESS_STATE", "enabled must be true or false.");
+    }
+    const reason = socialAccessReason(rawReason);
+    const targetResult = await this.pool.query<{
+      username: string;
+      admin_role: "MODERATOR" | "OWNER" | null;
+    }>(
+      `SELECT users.username, admin_accounts.role AS admin_role
+       FROM users
+       LEFT JOIN admin_accounts
+         ON admin_accounts.player_uuid = users.player_uuid AND admin_accounts.disabled_at IS NULL
+       WHERE users.player_uuid = $1`,
+      [playerUuid],
+    );
+    const target = targetResult.rows[0];
+    if (!target) throw new ApiError(404, "PLAYER_NOT_FOUND", "That G'Lib player does not exist.");
+    if (!canManageSocialAccess(admin, playerUuid, target.admin_role)) {
+      if (admin.playerUuid === playerUuid) {
+        throw new ApiError(403, "SOCIAL_ACCESS_SELF_TARGET", "You cannot change your own Friends & Chat access.");
+      }
+      if (target.admin_role === "OWNER") {
+        throw new ApiError(403, "SOCIAL_ACCESS_OWNER_PROTECTED", "Owner accounts cannot be restricted here.");
+      }
+      throw new ApiError(403, "SOCIAL_ACCESS_ADMIN_PROTECTED", "Only an owner can change a moderator's Friends & Chat access.");
+    }
+
+    const restrictionId = randomUUID();
+    await transaction(this.pool, async (client) => {
+      if (rawEnabled) {
+        const restored = await client.query<{ restriction_id: string }>(
+          `UPDATE social_access_restrictions
+           SET restored_at = now(), restored_by = $1, restore_reason = $2
+           WHERE player_uuid = $3 AND restored_at IS NULL
+           RETURNING restriction_id`,
+          [admin.playerUuid, reason, playerUuid],
+        );
+        if (restored.rowCount === 0) {
+          throw new ApiError(409, "SOCIAL_ACCESS_ALREADY_ENABLED", "Friends & Chat access is already enabled.");
+        }
+      } else {
+        const inserted = await client.query(
+          `INSERT INTO social_access_restrictions(
+             restriction_id, player_uuid, disabled_by, disable_reason
+           ) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (player_uuid) WHERE restored_at IS NULL DO NOTHING
+           RETURNING restriction_id`,
+          [restrictionId, playerUuid, admin.playerUuid, reason],
+        );
+        if (inserted.rowCount === 0) {
+          throw new ApiError(409, "SOCIAL_ACCESS_ALREADY_DISABLED", "Friends & Chat access is already disabled.");
+        }
+      }
+      await client.query(
+        `INSERT INTO admin_audit_log(admin_uuid, action, target_type, target_id, metadata)
+         VALUES ($1, $2, 'USER', $3, $4::jsonb)`,
+        [
+          admin.playerUuid,
+          rawEnabled ? "ADMIN_SOCIAL_ACCESS_RESTORED" : "ADMIN_SOCIAL_ACCESS_DISABLED",
+          playerUuid,
+          JSON.stringify({ ip, reason }),
+        ],
+      );
+    });
+
+    if (!rawEnabled) this.realtime?.disconnect(playerUuid);
+    return {
+      ...await socialAccessState(this.pool, playerUuid),
+      canModify: true,
     };
   }
 
@@ -1255,6 +1354,26 @@ function caseNote(value: unknown): string {
     throw new ApiError(400, "INVALID_NOTE", "Case note must contain 1-2000 characters.");
   }
   return note;
+}
+
+function socialAccessReason(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new ApiError(400, "INVALID_SOCIAL_ACCESS_REASON", "A moderation reason is required.");
+  }
+  const reason = value.trim();
+  if (reason.length < 1 || reason.length > 500) {
+    throw new ApiError(400, "INVALID_SOCIAL_ACCESS_REASON", "The moderation reason must contain 1-500 characters.");
+  }
+  return reason;
+}
+
+function canManageSocialAccess(
+  admin: AdminActor,
+  targetUuid: string,
+  targetRole: "MODERATOR" | "OWNER" | null,
+): boolean {
+  if (admin.playerUuid === targetUuid || targetRole === "OWNER") return false;
+  return targetRole === null || admin.role === "OWNER";
 }
 
 function cursorDate(value: unknown): Date {

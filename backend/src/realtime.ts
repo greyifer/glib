@@ -98,6 +98,21 @@ export class RealtimeHub {
     }
   }
 
+  disconnect(playerUuid: string, code = 4003, reason = "Friends & Chat access disabled"): void {
+    for (const connection of this.connections.get(playerUuid) ?? []) {
+      if (connection.socket.readyState === connection.socket.OPEN) {
+        connection.socket.send(JSON.stringify({
+          type: "error",
+          data: {
+            code: "SOCIAL_ACCESS_DISABLED",
+            message: "Friends & Chat access has been disabled for this account.",
+          },
+        }));
+      }
+      connection.socket.close(code, reason);
+    }
+  }
+
   async notifyFriends(playerUuid: string, type: string, payload: unknown): Promise<void> {
     const result = await this.pool.query<{ friend_uuid: string }>(
       `SELECT CASE WHEN player_low = $1 THEN player_high ELSE player_low END AS friend_uuid

@@ -316,6 +316,10 @@ export class SocialService {
          AND u.normalized_username IS NOT NULL
          AND strpos(u.normalized_username, $2) > 0
          AND NOT EXISTS (
+           SELECT 1 FROM social_access_restrictions restriction
+           WHERE restriction.player_uuid = u.player_uuid AND restriction.restored_at IS NULL
+         )
+         AND NOT EXISTS (
            SELECT 1 FROM blocks b
            WHERE (b.blocker_uuid = $1 AND b.blocked_uuid = u.player_uuid)
               OR (b.blocker_uuid = u.player_uuid AND b.blocked_uuid = $1)
@@ -344,6 +348,7 @@ export class SocialService {
     const target = targetResult.rows[0];
     if (!target) throw new ApiError(404, "PLAYER_NOT_FOUND", "No G'Lib player with that username was found.");
     if (target.player_uuid === actor.playerUuid) throw new ApiError(400, "SELF_TARGET", "You cannot friend yourself.");
+    await this.assertSocialAvailable(this.pool, target.player_uuid);
 
     const requestId = await transaction(this.pool, async (client) => {
       await this.assertNotBlocked(client, actor.playerUuid, target.player_uuid);
@@ -396,6 +401,7 @@ export class SocialService {
       );
       const row = request.rows[0];
       if (!row) throw new ApiError(404, "REQUEST_NOT_FOUND", "That friend request no longer exists.");
+      await this.assertSocialAvailable(client, row.player_uuid);
       await this.assertNotBlocked(client, actor.playerUuid, row.player_uuid);
       const [low, high] = orderedPair(actor.playerUuid, row.player_uuid);
       await client.query(
@@ -514,6 +520,7 @@ export class SocialService {
     const body = validateMessage(rawBody);
     await this.assertFriends(this.pool, actor.playerUuid, targetUuid);
     await this.assertNotBlocked(this.pool, actor.playerUuid, targetUuid);
+    await this.assertSocialAvailable(this.pool, targetUuid);
 
     const result = await this.pool.query<MessageRow>(
       `INSERT INTO messages(client_message_id, sender_uuid, recipient_uuid, sender_username_at_send, body)
@@ -541,6 +548,7 @@ export class SocialService {
     }
     await this.assertFriends(this.pool, actor.playerUuid, targetUuid);
     await this.assertNotBlocked(this.pool, actor.playerUuid, targetUuid);
+    await this.assertSocialAvailable(this.pool, targetUuid);
     this.realtime.send(targetUuid, "chat.typing", {
       playerUuid: actor.playerUuid,
       username: actor.username,
@@ -571,6 +579,7 @@ export class SocialService {
       for (const memberUuid of memberUuids) {
         await this.assertFriends(client, actor.playerUuid, memberUuid);
         await this.assertNotBlocked(client, actor.playerUuid, memberUuid);
+        await this.assertSocialAvailable(client, memberUuid);
       }
       await client.query(
         "INSERT INTO chat_groups(group_id, name, owner_uuid) VALUES ($1, $2, $3)",
@@ -616,6 +625,7 @@ export class SocialService {
       if (locked.rowCount !== 1) throw new ApiError(404, "GROUP_NOT_FOUND", "That group does not exist or you are not a member.");
       await this.assertFriends(client, actor.playerUuid, playerUuid);
       await this.assertNotBlocked(client, actor.playerUuid, playerUuid);
+      await this.assertSocialAvailable(client, playerUuid);
       const existing = await client.query(
         "SELECT 1 FROM group_members WHERE group_id = $1 AND player_uuid = $2",
         [groupId, playerUuid],
@@ -821,6 +831,17 @@ export class SocialService {
       [firstUuid, secondUuid],
     )).rowCount) {
       throw new ApiError(403, "BLOCKED", "This action is unavailable.");
+    }
+  }
+
+  private async assertSocialAvailable(client: Pool | PoolClient, playerUuid: string): Promise<void> {
+    if ((await client.query(
+      `SELECT 1 FROM social_access_restrictions
+       WHERE player_uuid = $1 AND restored_at IS NULL
+       LIMIT 1`,
+      [playerUuid],
+    )).rowCount) {
+      throw new ApiError(403, "PLAYER_SOCIAL_UNAVAILABLE", "This player is not available for Friends & Chat.");
     }
   }
 }

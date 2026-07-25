@@ -8,6 +8,7 @@ import { ApiError, parseBearer } from "./domain.js";
 import { AdminAuthService, ModerationService, ReportService } from "./moderation.js";
 import { RealtimeHub } from "./realtime.js";
 import { AuthService, SocialService } from "./services.js";
+import { requireSocialAccess } from "./social-access.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -58,13 +59,17 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   const realtime = new RealtimeHub(pool);
   const social = new SocialService(pool, realtime);
   const adminAuth = new AdminAuthService(pool, config.adminSessionTtlMinutes);
-  const moderation = new ModerationService(pool, adminAuth);
+  const moderation = new ModerationService(pool, adminAuth, realtime);
   const reports = new ReportService(pool);
   realtime.start();
 
   const authenticate = async (request: FastifyRequest): Promise<void> => {
     const token = parseBearer(request.headers.authorization);
     request.actor = await auth.actorForToken(token);
+  };
+  const authenticateSocial = async (request: FastifyRequest): Promise<void> => {
+    await authenticate(request);
+    await requireSocialAccess(pool, request.actor!.playerUuid);
   };
   const authenticateAdmin = async (request: FastifyRequest): Promise<void> => {
     await authenticate(request);
@@ -142,6 +147,16 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   app.get("/v1/admin/users/:playerUuid", { preHandler: requireReadyAdmin }, async (request) =>
     moderation.user(request.adminActor!, param(request, "playerUuid"), request.ip),
   );
+  app.patch("/v1/admin/users/:playerUuid/social-access", { preHandler: requireReadyAdmin }, async (request) => {
+    const data = body(request);
+    return moderation.setSocialAccess(
+      request.adminActor!,
+      param(request, "playerUuid"),
+      data.enabled,
+      data.reason,
+      request.ip,
+    );
+  });
   app.get("/v1/admin/direct/:firstUuid/:secondUuid", { preHandler: requireReadyAdmin }, async (request) =>
     moderation.directMessages(
       request.adminActor!,
@@ -203,10 +218,10 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
     return moderation.setMessageStar(request.adminActor!, data.kind, data.messageId, data.starred, request.ip);
   });
 
-  app.get("/v1/social", { preHandler: authenticate }, async (request) => social.snapshot(request.actor!));
+  app.get("/v1/social", { preHandler: authenticateSocial }, async (request) => social.snapshot(request.actor!));
   app.get(
     "/v1/players/search",
-    { preHandler: authenticate, config: { rateLimit: { max: 90, timeWindow: "1 minute" } } },
+    { preHandler: authenticateSocial, config: { rateLimit: { max: 90, timeWindow: "1 minute" } } },
     async (request) => social.searchPlayers(request.actor!, query(request, "q")),
   );
   app.delete("/v1/me", { preHandler: authenticate }, async (request, reply) => {
@@ -215,34 +230,34 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   });
   app.post(
     "/v1/friend-requests",
-    { preHandler: authenticate, config: { rateLimit: { max: 20, timeWindow: "1 hour" } } },
+    { preHandler: authenticateSocial, config: { rateLimit: { max: 20, timeWindow: "1 hour" } } },
     async (request, reply) => reply.status(201).send(await social.sendRequest(request.actor!, body(request).username)),
   );
-  app.post("/v1/friend-requests/:requestId/accept", { preHandler: authenticate }, async (request) =>
+  app.post("/v1/friend-requests/:requestId/accept", { preHandler: authenticateSocial }, async (request) =>
     social.acceptRequest(request.actor!, param(request, "requestId")),
   );
-  app.delete("/v1/friend-requests/:requestId", { preHandler: authenticate }, async (request, reply) => {
+  app.delete("/v1/friend-requests/:requestId", { preHandler: authenticateSocial }, async (request, reply) => {
     await social.deleteRequest(request.actor!, param(request, "requestId"));
     return reply.status(204).send();
   });
-  app.delete("/v1/friends/:playerUuid", { preHandler: authenticate }, async (request, reply) => {
+  app.delete("/v1/friends/:playerUuid", { preHandler: authenticateSocial }, async (request, reply) => {
     await social.removeFriend(request.actor!, param(request, "playerUuid"));
     return reply.status(204).send();
   });
-  app.post("/v1/blocks", { preHandler: authenticate }, async (request, reply) => {
+  app.post("/v1/blocks", { preHandler: authenticateSocial }, async (request, reply) => {
     await social.block(request.actor!, body(request).playerUuid);
     return reply.status(204).send();
   });
-  app.delete("/v1/blocks/:playerUuid", { preHandler: authenticate }, async (request, reply) => {
+  app.delete("/v1/blocks/:playerUuid", { preHandler: authenticateSocial }, async (request, reply) => {
     await social.unblock(request.actor!, param(request, "playerUuid"));
     return reply.status(204).send();
   });
-  app.get("/v1/messages/:playerUuid", { preHandler: authenticate }, async (request) =>
+  app.get("/v1/messages/:playerUuid", { preHandler: authenticateSocial }, async (request) =>
     social.messages(request.actor!, param(request, "playerUuid"), query(request, "before")),
   );
   app.post(
     "/v1/messages/:playerUuid",
-    { preHandler: authenticate, config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    { preHandler: authenticateSocial, config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
     async (request, reply) => {
       const data = body(request);
       const message = await social.sendMessage(
@@ -256,37 +271,37 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   );
   app.post(
     "/v1/reports",
-    { preHandler: authenticate, config: { rateLimit: { max: 10, timeWindow: "1 hour" } } },
+    { preHandler: authenticateSocial, config: { rateLimit: { max: 10, timeWindow: "1 hour" } } },
     async (request, reply) => {
       const data = body(request);
       return reply.status(201).send(await reports.submit(request.actor!, data.kind, data.messageId, data.reason));
     },
   );
-  app.get("/v1/groups", { preHandler: authenticate }, async (request) => social.groups(request.actor!));
+  app.get("/v1/groups", { preHandler: authenticateSocial }, async (request) => social.groups(request.actor!));
   app.post(
     "/v1/groups",
-    { preHandler: authenticate, config: { rateLimit: { max: 10, timeWindow: "1 hour" } } },
+    { preHandler: authenticateSocial, config: { rateLimit: { max: 10, timeWindow: "1 hour" } } },
     async (request, reply) => {
       const data = body(request);
       return reply.status(201).send(await social.createGroup(request.actor!, data.name, data.memberUuids));
     },
   );
-  app.patch("/v1/groups/:groupId", { preHandler: authenticate }, async (request) =>
+  app.patch("/v1/groups/:groupId", { preHandler: authenticateSocial }, async (request) =>
     social.renameGroup(request.actor!, param(request, "groupId"), body(request).name),
   );
-  app.post("/v1/groups/:groupId/members", { preHandler: authenticate }, async (request) =>
+  app.post("/v1/groups/:groupId/members", { preHandler: authenticateSocial }, async (request) =>
     social.addGroupMember(request.actor!, param(request, "groupId"), body(request).playerUuid),
   );
-  app.delete("/v1/groups/:groupId/members/:playerUuid", { preHandler: authenticate }, async (request, reply) => {
+  app.delete("/v1/groups/:groupId/members/:playerUuid", { preHandler: authenticateSocial }, async (request, reply) => {
     await social.removeGroupMember(request.actor!, param(request, "groupId"), param(request, "playerUuid"));
     return reply.status(204).send();
   });
-  app.get("/v1/group-messages/:groupId", { preHandler: authenticate }, async (request) =>
+  app.get("/v1/group-messages/:groupId", { preHandler: authenticateSocial }, async (request) =>
     social.groupMessages(request.actor!, param(request, "groupId"), query(request, "before")),
   );
   app.post(
     "/v1/group-messages/:groupId",
-    { preHandler: authenticate, config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    { preHandler: authenticateSocial, config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
     async (request, reply) => {
       const data = body(request);
       return reply.status(201).send(await social.sendGroupMessage(
@@ -300,7 +315,7 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
 
   app.get(
     "/v1/ws",
-    { websocket: true, preValidation: authenticate },
+    { websocket: true, preValidation: authenticateSocial },
     (socket, request) => {
       const actor = request.actor!;
       const sentAt: number[] = [];
@@ -312,7 +327,7 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
       socket.once("close", () => clearTimeout(sessionTimeout));
 
       socket.on("message", (raw: RawData) => {
-        void handleSocketMessage(socket, raw, actor, sentAt, social);
+        void handleSocketMessage(socket, raw, actor, sentAt, social, pool);
       });
       void realtime.add(actor, socket).then(
         () => socket.send(JSON.stringify({ type: "ready", data: { playerUuid: actor.playerUuid } })),
@@ -345,12 +360,14 @@ async function handleSocketMessage(
   actor: NonNullable<FastifyRequest["actor"]>,
   sentAt: number[],
   social: SocialService,
+  pool: Pool,
 ): Promise<void> {
   try {
     const now = Date.now();
     while (sentAt[0] !== undefined && sentAt[0] < now - 10_000) sentAt.shift();
     if (sentAt.length >= 20) throw new ApiError(429, "RATE_LIMITED", "You are sending messages too quickly.");
     sentAt.push(now);
+    await requireSocialAccess(pool, actor.playerUuid);
 
     const parsed = JSON.parse(raw.toString()) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -384,5 +401,8 @@ async function handleSocketMessage(
     throw new ApiError(400, "INVALID_EVENT", "Unsupported WebSocket event.");
   } catch (error) {
     websocketError(socket, error);
+    if (error instanceof ApiError && error.code === "SOCIAL_ACCESS_DISABLED") {
+      socket.close(4003, "Friends & Chat access disabled");
+    }
   }
 }

@@ -53,6 +53,7 @@ test("player search orders matches and reports relationships without blocked pla
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
     await database.exec(await readFile(resolve(migrationsDirectory, "001_initial.sql"), "utf8"));
+    await database.exec(await readFile(resolve(migrationsDirectory, "005_social_access_restrictions.sql"), "utf8"));
 
     const me = "00000000-0000-4000-8000-000000000001";
     const friend = "00000000-0000-4000-8000-000000000002";
@@ -91,6 +92,7 @@ test("typing events are transient, authenticated friend-only signals", async () 
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
     await database.exec(await readFile(resolve(migrationsDirectory, "001_initial.sql"), "utf8"));
+    await database.exec(await readFile(resolve(migrationsDirectory, "005_social_access_restrictions.sql"), "utf8"));
 
     const me = "00000000-0000-4000-8000-000000000001";
     const friend = "00000000-0000-4000-8000-000000000002";
@@ -133,7 +135,7 @@ test("group chats enforce membership, persistence, and the 20-player cap", async
     const database = new PGlite();
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
-    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql"]) {
+    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql", "005_social_access_restrictions.sql"]) {
       await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
     }
 
@@ -201,7 +203,7 @@ test("message reports snapshot the reported sender boundaries and all messages b
   const database = new PGlite();
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
-    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql"]) {
+    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql", "005_social_access_restrictions.sql"]) {
       await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
     }
     const reporter = "00000000-0000-4000-8000-000000000001";
@@ -265,7 +267,7 @@ test("moderation investigations persist search metadata, bookmarks, notes, and s
   const database = new PGlite();
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
-    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql"]) {
+    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql", "005_social_access_restrictions.sql"]) {
       await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
     }
     const firstPlayer = "00000000-0000-4000-8000-000000000001";
@@ -364,7 +366,7 @@ test("moderator login is UUID-bound, forces an initial password change, and stor
   const database = new PGlite();
   try {
     const migrationsDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../migrations");
-    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql"]) {
+    for (const file of ["001_initial.sql", "002_groups.sql", "003_moderation.sql", "004_investigations.sql", "005_social_access_restrictions.sql"]) {
       await database.exec(await readFile(resolve(migrationsDirectory, file), "utf8"));
     }
     const moderator = "00000000-0000-4000-8000-000000000001";
