@@ -123,6 +123,30 @@ test("moderator routes require both a moderator token and its matching Minecraft
     assert.equal(disabled.statusCode, 200);
     assert.equal(disabled.json().enabled, false);
 
+    await database.query(
+      "INSERT INTO friendships(player_low, player_high) VALUES ($1, $2)",
+      [moderator, normalUser],
+    );
+    const blockedInboundMessage = await app.inject({
+      method: "POST",
+      url: `/v1/messages/${normalUser}`,
+      headers: { authorization: `Bearer ${moderatorToken}` },
+      payload: {
+        clientMessageId: "00000000-0000-4000-8000-000000000010",
+        body: "This must not be delivered",
+      },
+    });
+    assert.equal(blockedInboundMessage.statusCode, 403);
+    assert.equal(blockedInboundMessage.json().error.code, "PLAYER_SOCIAL_UNAVAILABLE");
+
+    const hiddenFromSearch = await app.inject({
+      method: "GET",
+      url: "/v1/players/search?q=Normal",
+      headers: { authorization: `Bearer ${moderatorToken}` },
+    });
+    assert.equal(hiddenFromSearch.statusCode, 200);
+    assert.deepEqual(hiddenFromSearch.json(), []);
+
     const blockedSocial = await app.inject({
       method: "GET",
       url: "/v1/social",
