@@ -98,6 +98,12 @@ export class RealtimeHub {
     }
   }
 
+  broadcast(type: string, payload: unknown, excludePlayerUuid?: string): void {
+    for (const playerUuid of this.connections.keys()) {
+      if (playerUuid !== excludePlayerUuid) this.send(playerUuid, type, payload);
+    }
+  }
+
   disconnect(playerUuid: string, code = 4003, reason = "Friends & Chat access disabled"): void {
     for (const connection of this.connections.get(playerUuid) ?? []) {
       if (connection.socket.readyState === connection.socket.OPEN) {

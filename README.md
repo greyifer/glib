@@ -25,6 +25,12 @@ Mutable skin textures upload changed pixels on the next client tick. G'Lib also 
 
 Other APIs cover synchronized timers, animated HUD lists, configuration screens, editor layouts, keybind menus, fake players, broadcasts, and lightweight event handling.
 
+## Virtual Rooms
+
+G'Lib can capture a Minecraft build as one checksummed `.gsave` file and run it as a multiplayer, packet-only room. Room blocks are never placed in the host world: G'Lib uses per-player visual block updates, server-authoritative virtual collision, shared room sessions, normalized local coordinates, safe interaction hooks, a live in-game library, atomic hot reload, and optional two-way Railway repository synchronization.
+
+See [VIRTUAL_ROOMS.md](VIRTUAL_ROOMS.md) for the authoring commands, Java helpers, format, Railway repository, and current simulation boundaries.
+
 ## G'Network
 
 Press `K` and open **Friends & Chat** to send requests to other G'Lib players, see presence, and chat across Minecraft servers. Players authenticate with their current Minecraft session; the G'Network backend never receives their Microsoft/Minecraft access token.

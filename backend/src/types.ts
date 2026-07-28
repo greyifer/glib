@@ -61,5 +61,6 @@ declare module "fastify" {
   interface FastifyRequest {
     actor: Actor | null;
     adminActor: AdminActor | null;
+    roomSyncAuthenticated: boolean;
   }
 }

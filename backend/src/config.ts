@@ -8,6 +8,8 @@ export interface Config {
   adminSessionTtlMinutes: number;
   messageRetentionDays: number;
   trustProxy: boolean;
+  roomSyncToken: string | null;
+  roomSyncOwnerUuid: string | null;
 }
 
 function required(name: string): string {
@@ -35,7 +37,31 @@ function boolean(name: string, fallback: boolean): boolean {
   throw new Error(`${name} must be true or false`);
 }
 
+function roomSyncCredentials(): Pick<Config, "roomSyncToken" | "roomSyncOwnerUuid"> {
+  const token = process.env.GLIB_ROOM_SYNC_TOKEN;
+  const rawOwnerUuid = process.env.GLIB_ROOM_SYNC_OWNER_UUID;
+  const hasToken = token !== undefined && token !== "";
+  const hasOwnerUuid = rawOwnerUuid !== undefined && rawOwnerUuid !== "";
+  if (hasToken !== hasOwnerUuid) {
+    throw new Error(
+      "GLIB_ROOM_SYNC_TOKEN and GLIB_ROOM_SYNC_OWNER_UUID must either both be set or both be omitted",
+    );
+  }
+  if (!hasToken || !hasOwnerUuid) {
+    return { roomSyncToken: null, roomSyncOwnerUuid: null };
+  }
+  if (token.length < 32 || token.length > 256 || !/^[\x21-\x7e]+$/.test(token)) {
+    throw new Error("GLIB_ROOM_SYNC_TOKEN must contain 32-256 printable ASCII characters");
+  }
+  const ownerUuid = rawOwnerUuid.toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(ownerUuid)) {
+    throw new Error("GLIB_ROOM_SYNC_OWNER_UUID must be a canonical UUID");
+  }
+  return { roomSyncToken: token, roomSyncOwnerUuid: ownerUuid };
+}
+
 export function loadConfig(): Config {
+  const roomSync = roomSyncCredentials();
   return {
     databaseUrl: required("DATABASE_URL"),
     databaseSsl: boolean("DATABASE_SSL", false),
@@ -46,5 +72,6 @@ export function loadConfig(): Config {
     adminSessionTtlMinutes: integer("ADMIN_SESSION_TTL_MINUTES", 30, 5, 120),
     messageRetentionDays: integer("MESSAGE_RETENTION_DAYS", 90, 1, 3650),
     trustProxy: boolean("TRUST_PROXY", false),
+    ...roomSync,
   };
 }

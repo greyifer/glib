@@ -4,7 +4,12 @@
 	"package": "io.github.caspe.glib.mixin",
 	"compatibilityLevel": "JAVA_21",
 	"mixins": [
-		"EntityMovementLockMixin"
+		"EntityMovementLockMixin",
+		"PlayerManagerAccessor",
+		"VirtualRoomCollisionMixin",
+		"VirtualRoomExperiencePickupMixin",
+		"VirtualRoomItemPickupMixin",
+		"VirtualRoomNetworkHandlerMixin"
 	],
 	"client": [
 		"client.AbstractClientPlayerEntityMixin",

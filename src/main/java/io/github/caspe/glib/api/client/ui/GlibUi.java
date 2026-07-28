@@ -40,6 +40,24 @@ public final class GlibUi {
 		context.drawTextWithShadow(textRenderer, Text.literal(label), x + 8, y + 5, 0xFFFFFFFF);
 	}
 
+	/**
+	 * Normalizes text for controls and compact labels. Minecraft's font renderer exposes newline and
+	 * other control characters as missing-glyph boxes (often labelled LF), so UI that is deliberately
+	 * one line must remove them before measuring or drawing.
+	 */
+	public static String singleLine(String value) {
+		if (value == null || value.isBlank()) {
+			return "";
+		}
+		return value.replaceAll("[\\p{Cc}\\p{Zl}\\p{Zp}]+", " ")
+			.replaceAll("\\s+", " ")
+			.trim();
+	}
+
+	public static Text singleLine(Text value) {
+		return Text.literal(singleLine(value == null ? "" : value.getString()));
+	}
+
 	public static int withAlpha(int color, float alphaMultiplier) {
 		int alpha = (color >>> 24) & 0xFF;
 		return withAlpha(color, Math.round(alpha * clamp01(alphaMultiplier)));

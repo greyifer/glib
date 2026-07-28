@@ -15,6 +15,8 @@ public final class GlibNetworking {
 	public static void registerPayloads() {
 		if (REGISTERED.compareAndSet(false, true)) {
 			SkinNetworking.registerPayloads();
+			RoomLibraryNetworking.registerPayloads();
+			RoomOverlayNetworking.registerPayloads();
 			PayloadTypeRegistry.playS2C().register(TimerSyncPayload.ID, TimerSyncPayload.CODEC);
 			PayloadTypeRegistry.playS2C().register(ConfigSyncPayload.ID, ConfigSyncPayload.CODEC);
 			PayloadTypeRegistry.playC2S().register(GlibRequestPayload.ID, GlibRequestPayload.CODEC);

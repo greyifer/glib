@@ -3,6 +3,9 @@ package io.github.caspe.glib.client;
 import io.github.caspe.glib.api.client.GlibKeybindHud;
 import io.github.caspe.glib.api.client.menu.GlibMenuKeybind;
 import io.github.caspe.glib.api.client.menu.GlibMenuRegistry;
+import io.github.caspe.glib.client.room.ClientRoomLibrary;
+import io.github.caspe.glib.client.room.ClientRoomOverlay;
+import io.github.caspe.glib.client.room.GlibRoomLibraryScreen;
 import io.github.caspe.glib.client.social.GlibSocialClient;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
@@ -14,6 +17,8 @@ public final class GlibClient implements ClientModInitializer {
 	public void onInitializeClient() {
 		GlibMenuKeybind.register();
 		ClientTickEvents.END_CLIENT_TICK.register(GlibMenuKeybind::handle);
+		ClientRoomLibrary.init();
+		ClientRoomOverlay.init();
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> GlibSocialClient.INSTANCE.close());
 		registerMenuEntries();
 		DynamicSkinTextures.init();
@@ -26,6 +31,12 @@ public final class GlibClient implements ClientModInitializer {
 	}
 
 	private void registerMenuEntries() {
+		GlibMenuRegistry.register(
+			"glib_virtual_rooms",
+			net.minecraft.text.Text.literal("Virtual Rooms"),
+			0xFF55D6BE,
+			-20,
+			GlibRoomLibraryScreen::new);
 		GlibMenuRegistry.loadContributors();
 	}
 }

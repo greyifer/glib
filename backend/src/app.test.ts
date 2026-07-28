@@ -60,6 +60,8 @@ test("moderator routes require both a moderator token and its matching Minecraft
       adminSessionTtlMinutes: 30,
       messageRetentionDays: 90,
       trustProxy: false,
+      roomSyncToken: null,
+      roomSyncOwnerUuid: null,
     };
     app = await createApp(pool, config);
 

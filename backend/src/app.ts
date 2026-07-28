@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
@@ -7,8 +8,10 @@ import type { Config } from "./config.js";
 import { ApiError, parseBearer } from "./domain.js";
 import { AdminAuthService, ModerationService, ReportService } from "./moderation.js";
 import { RealtimeHub } from "./realtime.js";
+import { GSAVE_MAX_BYTES, GSAVE_MEDIA_TYPE, RoomRepository } from "./rooms.js";
 import { AuthService, SocialService } from "./services.js";
 import { requireSocialAccess } from "./social-access.js";
+import type { Actor } from "./types.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -27,6 +30,19 @@ function query(request: FastifyRequest, name: string): unknown {
   return (request.query as Record<string, unknown> | undefined)?.[name];
 }
 
+function roomNameHeader(value: unknown): unknown {
+  if (value === undefined || typeof value !== "string") return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new ApiError(
+      400,
+      "INVALID_ROOM_NAME",
+      "X-Glib-Room-Name must be percent-encoded UTF-8.",
+    );
+  }
+}
+
 function websocketError(socket: WebSocket, error: unknown): void {
   const apiError = error instanceof ApiError ? error : new ApiError(500, "INTERNAL_ERROR", "An unexpected error occurred.");
   socket.send(JSON.stringify({ type: "error", data: { code: apiError.code, message: apiError.message } }));
@@ -42,9 +58,21 @@ function adminBearer(request: FastifyRequest): string {
   }
 }
 
+function tokenHash(token: string): Buffer {
+  return createHash("sha256").update(token, "utf8").digest();
+}
+
 export async function createApp(pool: Pool, config: Config): Promise<FastifyInstance> {
+  const roomSyncActor = await configuredRoomSyncActor(pool, config.roomSyncOwnerUuid);
+  const roomSyncTokenHash = config.roomSyncToken === null ? null : tokenHash(config.roomSyncToken);
   const app = Fastify({
-    logger: { level: config.logLevel },
+    logger: {
+      level: config.logLevel,
+      redact: {
+        paths: ["req.headers['x-glib-room-sync-token']"],
+        censor: "[Redacted]",
+      },
+    },
     bodyLimit: 16 * 1024,
     trustProxy: config.trustProxy,
     requestTimeout: 15_000,
@@ -52,12 +80,19 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   });
   app.decorateRequest("actor", null);
   app.decorateRequest("adminActor", null);
+  app.decorateRequest("roomSyncAuthenticated", false);
   await app.register(rateLimit, { global: true, max: 180, timeWindow: "1 minute" });
   await app.register(websocket, { options: { maxPayload: 8 * 1024 } });
+  app.addContentTypeParser(
+    [GSAVE_MEDIA_TYPE, "application/octet-stream"],
+    { parseAs: "buffer" },
+    (_request, payload, done) => done(null, payload),
+  );
 
   const auth = new AuthService(pool, config.sessionTtlHours);
   const realtime = new RealtimeHub(pool);
   const social = new SocialService(pool, realtime);
+  const rooms = new RoomRepository(pool, realtime);
   const adminAuth = new AdminAuthService(pool, config.adminSessionTtlMinutes);
   const moderation = new ModerationService(pool, adminAuth, realtime);
   const reports = new ReportService(pool);
@@ -66,6 +101,21 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   const authenticate = async (request: FastifyRequest): Promise<void> => {
     const token = parseBearer(request.headers.authorization);
     request.actor = await auth.actorForToken(token);
+  };
+  const authenticateRoom = async (request: FastifyRequest): Promise<void> => {
+    request.roomSyncAuthenticated = false;
+    const candidate = request.headers["x-glib-room-sync-token"];
+    if (
+      typeof candidate === "string"
+      && roomSyncActor !== null
+      && roomSyncTokenHash !== null
+      && timingSafeEqual(tokenHash(candidate), roomSyncTokenHash)
+    ) {
+      request.actor = roomSyncActor;
+      request.roomSyncAuthenticated = true;
+      return;
+    }
+    await authenticate(request);
   };
   const authenticateSocial = async (request: FastifyRequest): Promise<void> => {
     await authenticate(request);
@@ -83,11 +133,27 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   };
 
   app.setErrorHandler((error, request, reply) => {
+    const routePath = request.url.split("?", 1)[0] ?? request.url;
+    const roomRoute = routePath === "/v1/rooms" || routePath.startsWith("/v1/rooms/");
     if (error instanceof ApiError) {
       return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message } });
     }
     if (typeof error === "object" && error !== null && "statusCode" in error && error.statusCode === 429) {
       return reply.status(429).send({ error: { code: "RATE_LIMITED", message: "Too many requests. Please wait and try again." } });
+    }
+    if (typeof error === "object" && error !== null && "statusCode" in error && error.statusCode === 413) {
+      return reply.status(413).send({
+        error: roomRoute
+          ? { code: "GSAVE_TOO_LARGE", message: `A .gsave file cannot exceed ${GSAVE_MAX_BYTES} bytes.` }
+          : { code: "PAYLOAD_TOO_LARGE", message: "The request body is too large." },
+      });
+    }
+    if (typeof error === "object" && error !== null && "statusCode" in error && error.statusCode === 415) {
+      return reply.status(415).send({
+        error: roomRoute
+          ? { code: "INVALID_GSAVE_MEDIA_TYPE", message: `Use ${GSAVE_MEDIA_TYPE} for .gsave uploads.` }
+          : { code: "UNSUPPORTED_MEDIA_TYPE", message: "The request content type is unsupported." },
+      });
     }
     request.log.error({ err: error }, "request failed");
     return reply.status(500).send({ error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred." } });
@@ -114,6 +180,75 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   );
   app.post("/v1/auth/logout", { preHandler: authenticate }, async (request, reply) => {
     await auth.revoke(parseBearer(request.headers.authorization));
+    return reply.status(204).send();
+  });
+
+  app.get("/v1/rooms", { preHandler: authenticateRoom }, async (request) =>
+    rooms.list(
+      query(request, "limit"),
+      query(request, "cursor"),
+      request.roomSyncAuthenticated ? request.actor!.playerUuid : null,
+    ),
+  );
+  app.post(
+    "/v1/rooms",
+    {
+      preHandler: authenticateRoom,
+      bodyLimit: GSAVE_MAX_BYTES,
+      config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      const metadata = await rooms.create(
+        request.actor!,
+        request.headers["x-glib-room-id"],
+        roomNameHeader(request.headers["x-glib-room-name"]),
+        request.body,
+      );
+      return reply
+        .status(201)
+        .header("Location", `/v1/rooms/${metadata.roomId}`)
+        .header("ETag", metadata.etag)
+        .header("X-Content-SHA256", metadata.sha256)
+        .send(metadata);
+    },
+  );
+  app.get("/v1/rooms/:roomId", { preHandler: authenticateRoom }, async (request, reply) => {
+    const room = await rooms.download(param(request, "roomId"));
+    if (request.headers["if-none-match"] === room.metadata.etag) {
+      return reply.status(304).send();
+    }
+    return reply
+      .header("Content-Type", GSAVE_MEDIA_TYPE)
+      .header("Content-Disposition", `attachment; filename="${room.metadata.archiveId}.gsave"`)
+      .header("ETag", room.metadata.etag)
+      .header("X-Content-SHA256", room.metadata.sha256)
+      .header("X-Glib-Room-Name", encodeURIComponent(room.metadata.name))
+      .send(room.payload);
+  });
+  app.put(
+    "/v1/rooms/:roomId",
+    {
+      preHandler: authenticateRoom,
+      bodyLimit: GSAVE_MAX_BYTES,
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      const metadata = await rooms.update(
+        request.actor!,
+        param(request, "roomId"),
+        request.headers["x-glib-room-id"],
+        request.headers["if-match"],
+        roomNameHeader(request.headers["x-glib-room-name"]),
+        request.body,
+      );
+      return reply
+        .header("ETag", metadata.etag)
+        .header("X-Content-SHA256", metadata.sha256)
+        .send(metadata);
+    },
+  );
+  app.delete("/v1/rooms/:roomId", { preHandler: authenticateRoom }, async (request, reply) => {
+    await rooms.delete(request.actor!, param(request, "roomId"));
     return reply.status(204).send();
   });
 
@@ -352,6 +487,22 @@ export async function createApp(pool: Pool, config: Config): Promise<FastifyInst
   cleanup.unref();
   app.addHook("onClose", async () => clearInterval(cleanup));
   return app;
+}
+
+async function configuredRoomSyncActor(
+  pool: Pool,
+  ownerUuid: string | null,
+): Promise<Actor | null> {
+  if (ownerUuid === null) return null;
+  const result = await pool.query<{ player_uuid: string; username: string }>(
+    "SELECT player_uuid, username FROM users WHERE player_uuid = $1",
+    [ownerUuid],
+  );
+  const row = result.rows[0];
+  if (!row) {
+    throw new Error("GLIB_ROOM_SYNC_OWNER_UUID must reference an existing G'Network user");
+  }
+  return { playerUuid: row.player_uuid, username: row.username };
 }
 
 async function handleSocketMessage(

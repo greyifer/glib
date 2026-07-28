@@ -3,7 +3,7 @@
 	"id": "glib",
 	"version": "${version}",
 	"name": "glib",
-	"description": "Skin, face, live mutable texture, and skin sync helpers for Fabric mods.",
+	"description": "Shared Fabric APIs for skins, UI, social features, and multiplayer packet-only virtual rooms.",
 	"authors": [
 		"Caspe"
 	],
@@ -26,7 +26,7 @@
 		"glib.mixins.json"
 	],
 	"depends": {
-		"fabricloader": ">=0.19.3",
+		"fabricloader": ">=0.18.4",
 		"fabric-api": "*",
 		"minecraft": "~1.21.1",
 		"java": ">=21"
