@@ -621,7 +621,7 @@ public final class RoomRuntime {
 		ActionResult callback = RoomInteractionCallback.EVENT.invoker().interact(context);
 		if (callback != ActionResult.PASS) {
 			RoomOverlaySender.sendBlock(session, local.get());
-			scheduleAttackCorrection(player, session, local.get(), kind);
+			scheduleInteractionCorrection(player, session, local.get(), hit, kind);
 			return callback;
 		}
 
@@ -630,18 +630,22 @@ public final class RoomRuntime {
 			player.swingHand(hand, true);
 		} else {
 			RoomOverlaySender.sendBlock(session, local.get());
-			scheduleAttackCorrection(player, session, local.get(), kind);
 		}
+		scheduleInteractionCorrection(player, session, local.get(), hit, kind);
 		return ActionResult.SUCCESS;
 	}
 
-	private static void scheduleAttackCorrection(
+	private static void scheduleInteractionCorrection(
 			ServerPlayerEntity player,
 			RoomSessionState session,
 			RoomPosition position,
+			BlockHitResult hit,
 			RoomInteractionCallback.Kind kind) {
-		if (kind == RoomInteractionCallback.Kind.ATTACK) {
-			session.scheduleCorrection(position, requireState(player.getServer()).tick() + 1L);
+		long correctionTick = requireState(player.getServer()).tick() + 1L;
+		session.scheduleCorrection(position, correctionTick);
+		if (kind == RoomInteractionCallback.Kind.USE) {
+			session.toLocal(hit.getBlockPos().offset(hit.getSide()))
+				.ifPresent(adjacent -> session.scheduleCorrection(adjacent, correctionTick));
 		}
 	}
 
